@@ -62,6 +62,22 @@ Whether you are building a personal library, keeping track of books you want to 
 - Custom book cards and search results.
 - Responsive background tasks for online searches and image downloads.
 
+## Application Preview
+
+Bookora supports both Persian and English book collections, with dark and light interface themes.
+
+### Persian Bookshelf
+
+![Bookora Persian Library](assets/bookora-persian.png)
+
+### English Bookshelf — Dark Mode
+
+![Bookora English Library - Dark Mode](assets/bookora-english-dark.png)
+
+### English Bookshelf — Light Mode
+
+![Bookora English Library - Light Mode](assets/bookora-english-light.png)
+
 ## Tech Stack
 
 | Technology | Purpose |
