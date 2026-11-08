@@ -1,4 +1,4 @@
-# Bookora
+# # Bookora – Personal Digital Library & Book Reading Tracker
 
 **Your Personal Digital Library & Reading Companion**
 
