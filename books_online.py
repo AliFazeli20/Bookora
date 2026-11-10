@@ -2,7 +2,8 @@
 Install:  pip install PySide6
 Run:      python books_online.py
 
-Tip: for the best Persian text, install the free Vazirmatn font (the app uses it if present).
+Tip: for the best Persian text, put Vazirmatn-Regular.ttf and Vazirmatn-Bold.ttf in a folder named
+'fonts' next to this file (or install the free Vazirmatn font); the app uses it if present.
 """
 import calendar
 import csv
@@ -31,11 +32,13 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime
 from pathlib import Path
 
-from PySide6.QtCore import (QObject, QPoint, QPointF, QRectF, QRunnable, QSize, Qt,
+from PySide6.QtCore import (QBuffer, QByteArray, QEvent, QIODevice, QObject, QPoint, QPointF,
+                            QPropertyAnimation, QRectF, QRunnable, QSize, Qt,
                             QThreadPool, QTimer, Signal)
-from PySide6.QtGui import (QColor, QFont, QFontMetrics, QKeySequence,
+from PySide6.QtGui import (QColor, QCursor, QFont, QFontDatabase, QFontMetrics, QIcon, QKeySequence,
                            QLinearGradient, QPainter, QPainterPath, QPen,
-                           QImage, QImageReader, QPixmap, QShortcut)
+                           QImage, QImageReader, QPixmap, QShortcut,
+                           QTextLayout, QTextOption)
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup, QCheckBox,
                                QComboBox, QDialog, QFileDialog, QFormLayout, QFrame,
                                QHBoxLayout, QLabel, QLineEdit, QListWidget,
@@ -45,8 +48,10 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup, QC
 
 from PySide6.QtCore import QUrl
 from PySide6.QtGui import QDesktopServices
-from PySide6.QtWidgets import QMenu, QProgressBar, QScrollArea, QSizePolicy
+from PySide6.QtWidgets import (QGraphicsOpacityEffect, QMenu, QProgressBar, QScrollArea,
+                               QSizePolicy)
 
+APP_VERSION = "0.2.0"                # one place to change it for a release (also shown in Data & backup)
 DB = os.environ.get("BOOKS_DB", "books.db")
 COVERS_DIR = Path(DB).resolve().parent / "covers"
 BACKUP_DIR = Path(DB).resolve().parent / "backups"
@@ -71,7 +76,10 @@ def user_agent(identify=False):
     return f"MyBooksApp/1.0 ({email})" if email else "MyBooksApp/1.0"
 STATUSES = ["Read", "Reading", "Want to read"]
 WISH = "Want to buy"                # the wishlist: books to buy in the future (own table)
-CARD_W, CARD_H = 190, 290
+COVER_H = 180                        # height of the cover area on a card
+CARD_W, CARD_H = 190, COVER_H + 150
+# chip colours on the cards (white text on each; they sit on top of the cover, so they do not depend on the theme)
+STATUS_COLORS = {"Read": "#23915f", "Reading": "#3b6fe0", "Want to read": "#c2710c", WISH: "#a855c7"}
 SORTS = {
     "Newest first": "id DESC",
     "Oldest first": "id ASC",
@@ -98,6 +106,15 @@ JMONTHS = ["فروردین", "اردیبهشت", "خرداد", "تیر", "مرد
            "مهر", "آبان", "آذر", "دی", "بهمن", "اسفند"]
 CAL = {"mode": load_settings().get("calendar", "gregorian")}
 _DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
+_FA_DIGITS = str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹")
+
+
+def fa_num(value):
+    """Digits of a DATE as shown on screen: Persian digits when the Jalali calendar is chosen, plain
+    digits otherwise. Only for dates: counts and ratings keep plain digits, and nothing that is
+    stored or exported (CSV, database) ever goes through this."""
+    text = str(value)
+    return text.translate(_FA_DIGITS) if CAL["mode"] == "jalali" else text
 
 
 def g2j(gy, gm, gd):
@@ -208,10 +225,15 @@ def fmt_date(stored):
         return stored
     prec = date_prec(stored)
     if prec == "y":
-        return f"≈ {y}"
-    if prec == "m":
-        return f"≈ {month_names()[m - 1]} {y}"
-    return f"{d} {month_names()[m - 1]} {y}"
+        text = f"≈ {y}"
+    elif prec == "m":
+        text = f"≈ {month_names()[m - 1]} {y}"
+    else:
+        text = f"{d} {month_names()[m - 1]} {y}"
+    if CAL["mode"] == "jalali":
+        # the isolate keeps the Persian date in its own right-to-left order inside an English sentence
+        return "\u2068" + fa_num(text) + "\u2069"
+    return text
 
 
 def _iso(y, m, d):
@@ -350,12 +372,33 @@ class Store:
                          (title, author, notes, cover, id_))
         self.con.commit()
 
+    def restore_row(self, row, wish):
+        """Puts a deleted card back (Undo) with its ORIGINAL id and every field.
+        row: (id,title,author,status,rating,notes,cover,started,finished) as the card grid has it."""
+        _id, t, a, st, r, n, c, d0, d1 = row
+        with self.con:
+            if wish:
+                self.con.execute("INSERT INTO wishlist(id,title,author,notes,cover) VALUES(?,?,?,?,?)",
+                                 (_id, t, a, n, c))
+            else:
+                self.con.execute(
+                    "INSERT INTO books(id,title,author,status,rating,notes,cover,started,finished) "
+                    "VALUES(?,?,?,?,?,?,?,?,?)", (_id, t, a, st, r, n, c, d0, d1))
+
     def wish_delete(self, id_):
         self.con.execute("DELETE FROM wishlist WHERE id=?", (id_,))
         self.con.commit()
 
     def wish_count(self):
         return self.con.execute("SELECT COUNT(*) FROM wishlist").fetchone()[0]
+
+    def cover_of(self, title):
+        """File name of the cover a library book or wishlist entry with this title already has (or None)."""
+        row = self.con.execute(
+            "SELECT cover FROM books WHERE lower(title)=lower(?) AND cover IS NOT NULL AND cover!='' "
+            "UNION SELECT cover FROM wishlist WHERE lower(title)=lower(?) AND cover IS NOT NULL AND cover!=''",
+            (title.strip(), title.strip())).fetchone()
+        return row[0] if row else None
 
     def wish_exists(self, title, exclude_id=None):
         return self.con.execute(
@@ -703,7 +746,7 @@ def _ol(params):
     return out
 
 
-def search_openlibrary(query, mode, hint=""):
+def search_openlibrary(query, mode, hint="", popular=True):
     base = {"limit": 25, "fields": "title,author_name,first_publish_year,cover_i,edition_count"}
     if mode == "title":
         base["title"] = query
@@ -712,10 +755,11 @@ def search_openlibrary(query, mode, hint=""):
     else:
         base["author"] = query
     out = _ol(base)                              # best text matches
-    try:
-        out += _ol(dict(base, sort="editions"))  # plus the most popular matches
-    except ApiError:
-        pass
+    if popular:
+        try:
+            out += _ol(dict(base, sort="editions"))  # plus the most popular matches
+        except ApiError:
+            pass
     return out
 
 
@@ -1207,6 +1251,107 @@ def fetch_cover_checked(url):
     return path
 
 
+# ---- result previews: small pictures that live in memory only (never written to covers/). One download
+# per row; the picture is cut down while it is decoded, and the newest PREVIEW_MAX stay in a small cache.
+PREVIEW_W, PREVIEW_H = 93, 138        # 1.5 x the 62 x 92 box of a result row
+PREVIEW_MAX = 120                     # about 6 MB of pictures at most
+MAX_PREVIEW_BYTES = 1536 * 1024
+_PREVIEWS, _PREVIEW_LOCK = {}, threading.Lock()
+
+
+def preview_get(key):
+    """QImage, False (looked up before, nothing found) or None (not looked up yet)."""
+    with _PREVIEW_LOCK:
+        return _PREVIEWS.get(key)
+
+
+def preview_put(key, value):
+    with _PREVIEW_LOCK:
+        _PREVIEWS.pop(key, None)
+        _PREVIEWS[key] = value
+        while len(_PREVIEWS) > PREVIEW_MAX:
+            del _PREVIEWS[next(iter(_PREVIEWS))]
+
+
+def preview_url(url):
+    """A smaller version of the same picture where the source offers sizes (Open Library S/M/L,
+    Apple's size in the address); any other address is used as it is."""
+    if url.startswith("https://covers.openlibrary.org/") and url.endswith("-L.jpg"):
+        return url[:-6] + "-M.jpg"
+    if "400x400bb" in url:
+        return url.replace("400x400bb", "200x200bb")
+    return url
+
+
+def decode_preview(data):
+    """Bytes of a picture -> QImage no bigger than PREVIEW_W x PREVIEW_H. A big picture is cut down
+    while it is read, so it is never decoded at full size. Raises ValueError for anything unusable."""
+    if not looks_like_image(data):
+        raise ValueError("no usable cover")
+    buf = QBuffer()
+    buf.setData(QByteArray(data))
+    buf.open(QIODevice.ReadOnly)
+    reader = QImageReader(buf)
+    size = reader.size()
+    if not size.isValid() or size.width() * size.height() > MAX_PIXELS:
+        raise ValueError("no usable cover")
+    k = min(PREVIEW_W / size.width(), PREVIEW_H / size.height(), 1.0)
+    if k < 1.0:
+        reader.setScaledSize(QSize(max(1, round(size.width() * k)), max(1, round(size.height() * k))))
+    img = reader.read()
+    if img.isNull():
+        raise ValueError("no usable cover")
+    return img
+
+
+def fetch_preview(url):
+    """The preview of one cover address: one download (the small variant when there is one)."""
+    hit = preview_get(url)
+    if hit:
+        return hit
+    small = preview_url(url)
+    try:
+        data = http_get(small, max_bytes=MAX_PREVIEW_BYTES)
+    except ApiError:
+        if small == url:
+            raise
+        data = http_get(url, max_bytes=MAX_PREVIEW_BYTES)     # that size was not offered: the normal one
+    img = decode_preview(data)
+    preview_put(url, img)
+    return img
+
+
+def find_preview(title, author):
+    """Preview for a book that came without a cover address (Persian / Wikidata results): look it up
+    by title + author, then download ONE picture."""
+    key = ("find", norm(title), norm(author))
+    hit = preview_get(key)
+    if hit:
+        return hit
+    if hit is False:
+        raise ValueError("no cover found")
+    want, url, errors = surname(author), None, []
+    for search in (search_apple, functools.partial(search_openlibrary, popular=False)):
+        try:
+            for d in search(title, "title", author):
+                if d["cover_url"] and (not want or want in norm(d["author"])):
+                    url = d["cover_url"]
+                    break
+        except ApiError as e:
+            errors.append(e)
+            continue
+        if url:
+            break
+    if not url:
+        if len(errors) == 2:                  # both sources failed: it is the network, not the book
+            raise errors[0]
+        preview_put(key, False)
+        raise ValueError("no cover found")
+    img = fetch_preview(url)
+    preview_put(key, img)
+    return img
+
+
 def find_cover(title, author):
     """For books that came without a cover: look one up by title + author."""
     want = surname(author)
@@ -1314,6 +1459,8 @@ def find_cover_for(title, author):
 
 COVER_POOL = QThreadPool()          # few threads: be polite to the cover servers
 COVER_POOL.setMaxThreadCount(3)
+LOOKUP_POOL = QThreadPool()         # previews that need a search first: one at a time
+LOOKUP_POOL.setMaxThreadCount(1)
 COVER_ATTACH = {"n": 0}             # covers still being fetched for books that were just added
 
 
@@ -1353,11 +1500,11 @@ def get_pixmap(path):
     return _PIX[path]
 
 
-def draw_book_cover(p, area, pm):
-    h = area.height() - 22
+def draw_book_cover(p, area, pm, vpad=22, hpad=30):
+    h = area.height() - vpad
     w = h * pm.width() / pm.height()
-    if w > area.width() - 30:
-        w = area.width() - 30
+    if w > area.width() - hpad:
+        w = area.width() - hpad
         h = w * pm.height() / pm.width()
     rect = QRectF(area.center().x() - w / 2, area.center().y() - h / 2 + 2, w, h)
     p.setRenderHint(QPainter.SmoothPixmapTransform)
@@ -1370,6 +1517,42 @@ def draw_book_cover(p, area, pm):
     p.setClipPath(clip)
     p.drawPixmap(rect, pm, QRectF(pm.rect()))
     p.restore()
+
+_BLUR = {}
+
+
+def blurred_backdrop(pm):
+    """Tiny smooth copy of the cover; drawn stretched it looks like a soft blur of the same picture.
+    Cached, so each cover is shrunk only once."""
+    key = pm.cacheKey()
+    if key not in _BLUR:
+        _BLUR[key] = pm.scaled(10, 15, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+    return _BLUR[key]
+
+
+def clear_icon():
+    """Round 'x' for the search box, in the current theme's colours (the stock Qt clear button is
+    nearly invisible on the dark theme)."""
+    pm = QPixmap(32, 32)
+    pm.setDevicePixelRatio(2)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing)
+    p.setPen(Qt.NoPen)
+    p.setBrush(QColor(T["muted"]))
+    p.drawEllipse(QRectF(1, 1, 14, 14))
+    p.setPen(QPen(QColor(T["input"]), 1.6, Qt.SolidLine, Qt.RoundCap))
+    p.drawLine(QPointF(5.3, 5.3), QPointF(10.7, 10.7))
+    p.drawLine(QPointF(10.7, 5.3), QPointF(5.3, 10.7))
+    p.end()
+    return QIcon(pm)
+
+
+def mix(c1, c2, t):
+    """Colour between c1 (t=0) and c2 (t=1)."""
+    return QColor(*(round(a + (b - a) * t) for a, b in
+                    ((c1.red(), c2.red()), (c1.green(), c2.green()), (c1.blue(), c2.blue()))))
+
 
 def star_path(cx, cy, r):
     path = QPainterPath()
@@ -1405,7 +1588,99 @@ def align_for(text):
     return (Qt.AlignRight if is_rtl(text) else Qt.AlignLeft) | Qt.AlignVCenter
 
 
+def wrap_lines(text, font, width, max_lines=2):
+    """Breaks text into at most max_lines lines that fit `width`; the last line ends with … when the
+    text is longer. Long words without spaces are broken too (Persian titles, URLs...)."""
+    text = " ".join((text or "").split())
+    if not text:
+        return []
+    lay = QTextLayout(text, font)
+    opt = QTextOption()
+    opt.setWrapMode(QTextOption.WrapAtWordBoundaryOrAnywhere)
+    lay.setTextOption(opt)
+    spans = []
+    lay.beginLayout()
+    while True:
+        line = lay.createLine()
+        if not line.isValid():
+            break
+        line.setLineWidth(width)
+        spans.append((line.textStart(), line.textLength()))
+        if len(spans) > max_lines:                    # one more than allowed: the text overflows
+            break
+    lay.endLayout()
+    if len(spans) <= max_lines:
+        return [text[a:a + n].strip() for a, n in spans]
+    out = [text[a:a + n].strip() for a, n in spans[:max_lines - 1]]
+    out.append(QFontMetrics(font).elidedText(text[spans[max_lines - 1][0]:], Qt.ElideRight, int(width) - 3))
+    return out
+
+
 class BookDelegate(QStyledItemDelegate):
+    """Draws the cards. The hovered card rises smoothly (about 0.1 s) instead of jumping."""
+    STEP = 0.16                                   # progress per tick (16 ms): ~100 ms in total
+
+    def __init__(self, view):
+        super().__init__(view)
+        self.view = view
+        self.level = {}                           # book id -> hover progress 0..1
+        self.hovered = None                       # id of the card under the mouse
+        self.timer = QTimer(self)
+        self.timer.setInterval(16)
+        self.timer.timeout.connect(self._tick)
+        view.viewport().setMouseTracking(True)
+        view.viewport().installEventFilter(self)
+        view.verticalScrollBar().valueChanged.connect(self.recheck)
+
+    def eventFilter(self, obj, e):
+        t = e.type()
+        if t == QEvent.MouseMove:
+            idx = self.view.indexAt(e.position().toPoint())
+            row = idx.data(Qt.UserRole) if idx.isValid() else None
+            self.set_hovered(row[0] if row else None)
+        elif t == QEvent.Leave:
+            self.set_hovered(None)
+        return False                              # never swallow an event
+
+    def recheck(self, *_):
+        """The mouse did not move but the cards did (wheel / scroll bar): find the card under it again."""
+        vp = self.view.viewport()
+        pos = QCursor.pos()
+        if QApplication.widgetAt(pos) is not vp:
+            self.set_hovered(None)
+            return
+        idx = self.view.indexAt(vp.mapFromGlobal(pos))
+        row = idx.data(Qt.UserRole) if idx.isValid() else None
+        self.set_hovered(row[0] if row else None)
+
+    def set_hovered(self, book_id):
+        if book_id == self.hovered:
+            return
+        self.hovered = book_id
+        if book_id is not None:
+            self.level.setdefault(book_id, 0.0)
+        if not self.timer.isActive() and self.level:
+            self.timer.start()
+
+    def reset(self):
+        """Called when the list is rebuilt (card ids are no longer the same cards)."""
+        self.level.clear()
+        self.hovered = None
+        self.timer.stop()
+
+    def _tick(self):
+        for k in list(self.level):
+            goal = 1.0 if k == self.hovered else 0.0
+            v = self.level[k]
+            v = min(goal, v + self.STEP) if goal > v else max(goal, v - self.STEP)
+            if v == 0.0 and goal == 0.0:
+                del self.level[k]
+            else:
+                self.level[k] = v
+        if not self.level or all(v == (1.0 if k == self.hovered else 0.0) for k, v in self.level.items()):
+            self.timer.stop()
+        self.view.viewport().update()
+
     def sizeHint(self, option, index):
         return QSize(CARD_W, CARD_H)
 
@@ -1416,10 +1691,10 @@ class BookDelegate(QStyledItemDelegate):
         p.setRenderHint(QPainter.TextAntialiasing)
 
         r = QRectF(option.rect).adjusted(8, 8, -8, -8)
-        hover = bool(option.state & QStyle.State_MouseOver)
         selected = bool(option.state & QStyle.State_Selected)
-        if hover:
-            r.translate(0, -4)
+        lvl = self.level.get(_id, 0.0)
+        lvl = lvl * lvl * (3 - 2 * lvl)                       # ease in-out
+        r.translate(0, -4 * lvl)
 
         # soft shadow
         for i, a in enumerate((10, 16, 22)):
@@ -1430,30 +1705,33 @@ class BookDelegate(QStyledItemDelegate):
         card = QPainterPath()
         card.addRoundedRect(r, 16, 16)
         p.fillPath(card, QColor(T["card"]))
-        p.setPen(QPen(QColor(T["accent"]) if (hover or selected) else QColor(T["border"]),
+        p.setPen(QPen(QColor(T["accent"]) if selected
+                      else mix(QColor(T["border"]), QColor(T["accent"]), lvl),
                       2 if selected else 1))
         p.drawPath(card)
 
         # cover
-        cover = QRectF(r.left(), r.top(), r.width(), 150)
+        cover = QRectF(r.left(), r.top(), r.width(), COVER_H)
         cover_clip = QPainterPath()
         cover_clip.addRect(cover)
         p.setClipPath(card.intersected(cover_clip))
-        c1, c2 = cover_colors(title)
-        grad = QLinearGradient(cover.topLeft(), cover.bottomRight())
-        grad.setColorAt(0, c1)
-        grad.setColorAt(1, c2)
-        p.fillRect(cover, grad)
-        p.setPen(Qt.NoPen)
-        p.setBrush(QColor(255, 255, 255, 30))
-        p.drawEllipse(QPointF(r.right() - 10, r.top() + 15), 62, 62)
-        p.setBrush(QColor(0, 0, 0, 28))
-        p.drawEllipse(QPointF(r.left() + 10, cover.bottom() - 5), 48, 48)
-
         pm = get_pixmap(cover_path)
-        if pm:
-            draw_book_cover(p, cover, pm)
+        if pm:                                                # the cover's own soft blur behind it
+            p.setRenderHint(QPainter.SmoothPixmapTransform)
+            p.drawPixmap(cover, blurred_backdrop(pm), QRectF(blurred_backdrop(pm).rect()))
+            p.fillRect(cover, QColor(0, 0, 0, 70))
+            draw_book_cover(p, cover, pm, vpad=22, hpad=26)
         else:
+            c1, c2 = cover_colors(title)
+            grad = QLinearGradient(cover.topLeft(), cover.bottomRight())
+            grad.setColorAt(0, c1)
+            grad.setColorAt(1, c2)
+            p.fillRect(cover, grad)
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(255, 255, 255, 30))
+            p.drawEllipse(QPointF(r.right() - 10, r.top() + 15), 62, 62)
+            p.setBrush(QColor(0, 0, 0, 28))
+            p.drawEllipse(QPointF(r.left() + 10, cover.bottom() - 5), 48, 48)
             f = QFont(option.font)
             f.setPointSize(13)
             f.setBold(True)
@@ -1472,7 +1750,9 @@ class BookDelegate(QStyledItemDelegate):
         chip_w = fm.horizontalAdvance(status or "") + 18
         chip = QRectF(r.left() + 10, r.top() + 10, chip_w, 22)
         p.setPen(Qt.NoPen)
-        p.setBrush(QColor(0, 0, 0, 110))
+        chip_color = QColor(STATUS_COLORS.get(status, "#000000"))
+        chip_color.setAlpha(235 if status in STATUS_COLORS else 110)
+        p.setBrush(chip_color)
         p.drawRoundedRect(chip, 11, 11)
         p.setPen(QColor("white"))
         p.drawText(chip, Qt.AlignCenter, status or "")
@@ -1484,22 +1764,25 @@ class BookDelegate(QStyledItemDelegate):
         f.setBold(True)
         p.setFont(f)
         p.setPen(QColor(T["text"]))
-        p.drawText(QRectF(tx, r.top() + 160, tw, 24), align_for(title),
-                   QFontMetrics(f).elidedText(title, Qt.ElideRight, int(tw)))
+        lh = min(QFontMetrics(f).lineSpacing(), 20)
+        lines = wrap_lines(title, f, tw, 2) or [""]
+        for i, line in enumerate(lines):
+            p.drawText(QRectF(tx, r.top() + COVER_H + 8 + i * lh, tw, lh), align_for(title), line)
+        author_top = r.top() + COVER_H + 10 + len(lines) * lh
 
         f = QFont(option.font)
         f.setPointSize(9)
         p.setFont(f)
         p.setPen(QColor(T["muted"]))
-        p.drawText(QRectF(tx, r.top() + 186, tw, 20), align_for(author or ""),
+        p.drawText(QRectF(tx, author_top, tw, 20), align_for(author or ""),
                    QFontMetrics(f).elidedText(author or "Unknown author", Qt.ElideRight, int(tw)))
 
         if status == WISH:                      # wishlist card: first note line (price, shop...)
             line = next(iter((_notes or "").strip().splitlines()), "")
-            p.drawText(QRectF(tx, r.top() + 216, tw, 22), align_for(line),
+            p.drawText(QRectF(tx, r.top() + COVER_H + 74, tw, 22), align_for(line),
                        QFontMetrics(f).elidedText(line, Qt.ElideRight, int(tw)))
         else:
-            draw_stars(p, tx, r.top() + 218, 9, rating)
+            draw_stars(p, tx, r.top() + COVER_H + 76, 9, rating)
         note = (f"Finished {fmt_date(finished)}" if finished
                 else f"Started {fmt_date(started)}" if started and status == "Reading" else "")
         if note:
@@ -1507,7 +1790,7 @@ class BookDelegate(QStyledItemDelegate):
             f.setPointSize(8)
             p.setFont(f)
             p.setPen(QColor(T["muted"]))
-            p.drawText(QRectF(tx, r.top() + 244, tw, 18), Qt.AlignLeft | Qt.AlignVCenter,
+            p.drawText(QRectF(tx, r.top() + COVER_H + 102, tw, 18), Qt.AlignLeft | Qt.AlignVCenter,
                        QFontMetrics(f).elidedText(note, Qt.ElideRight, int(tw)))
         p.restore()
 
@@ -1811,9 +2094,10 @@ class NumberEdit(QLineEdit):
     """Whole-number input that accepts Persian digits and clamps to [lo, hi]."""
     valueChanged = Signal(int)
 
-    def __init__(self, lo, hi):
+    def __init__(self, lo, hi, fa=False):
         super().__init__()
         self.lo, self.hi = lo, hi
+        self.fa = fa                              # show Persian digits (typing either kind works)
         self.setAlignment(Qt.AlignCenter)
         self.editingFinished.connect(self._clamp)
 
@@ -1823,7 +2107,8 @@ class NumberEdit(QLineEdit):
         return max(self.lo, min(self.hi, v))
 
     def setValue(self, v):
-        self.setText(str(max(self.lo, min(self.hi, v))))
+        text = str(max(self.lo, min(self.hi, v)))
+        self.setText(text.translate(_FA_DIGITS) if self.fa else text)
 
     def setRange(self, lo, hi):
         self.lo, self.hi = lo, hi
@@ -1860,10 +2145,10 @@ class DateField(QWidget):
         self.on.toggled.connect(self._toggled)
         self.prec = QComboBox()
         self.prec.addItems(self.LABELS)
-        self.d = NumberEdit(1, 31)
+        self.d = NumberEdit(1, 31, fa=self.jalali)
         self.m = QComboBox()
         self.m.addItems(month_names())
-        self.y = NumberEdit(1300, 1500) if self.jalali else NumberEdit(1900, 2100)
+        self.y = NumberEdit(1300, 1500, fa=True) if self.jalali else NumberEdit(1900, 2100)
         self.d.setFixedWidth(54)
         self.y.setFixedWidth(78)
         lay.addWidget(self.on)
@@ -1878,8 +2163,8 @@ class DateField(QWidget):
         self.m.currentIndexChanged.connect(self._part_changed)
         self.y.valueChanged.connect(self._part_changed)
         self.d.valueChanged.connect(lambda *_: self.changed.emit())
-        self.d.setText("1")
-        self.y.setText(str(self.y.lo))
+        self.d.setValue(1)
+        self.y.setValue(self.y.lo)
         self._apply_prec()
         self._enable(False)
 
@@ -2182,6 +2467,7 @@ class BookDialog(QDialog):
         for a, b in zip(chain, chain[1:]):
             QWidget.setTabOrder(a, b)
         self.title_e.setFocus()
+        self.mark_clean()                           # what the form looks like before the person touches it
 
     # -- behaviour
     def status_changed(self, status):
@@ -2341,6 +2627,45 @@ class BookDialog(QDialog):
         else:
             self._cover_idle(f"Couldn’t search — {message}.")
 
+    # -- unsaved changes: Cancel, Esc and the window's close button all end up in reject()
+    def _state(self):
+        return self.wish_values() if self.wish else self.values()
+
+    def mark_clean(self):
+        """Remembers the current form as 'nothing changed yet'. The window calls it again after it
+        pre-selects a status, so a Cancel right after that does not ask anything."""
+        self._clean = self._state()
+
+    def is_dirty(self):
+        return self._state() != self._clean
+
+    def _ask_discard(self):
+        """'save', 'discard' or 'keep'. Enter and Esc both mean 'keep editing' (the safe choice)."""
+        adding = self.book is None
+        box = QMessageBox(QMessageBox.Question,
+                          "Discard this new book?" if adding else "Discard your changes?",
+                          "This book hasn’t been added yet." if adding
+                          else "You have unsaved changes to this book.",
+                          QMessageBox.NoButton, self)
+        save = box.addButton(self.save_btn.text(), QMessageBox.AcceptRole)
+        drop = box.addButton("Discard", QMessageBox.DestructiveRole)
+        keep = box.addButton("Keep editing", QMessageBox.RejectRole)
+        box.setDefaultButton(keep)
+        box.setEscapeButton(keep)
+        box.exec()
+        clicked = box.clickedButton()
+        return "save" if clicked is save else "discard" if clicked is drop else "keep"
+
+    def reject(self):
+        if self.is_dirty():
+            choice = self._ask_discard()
+            if choice == "keep":
+                return
+            if choice == "save":
+                self._save()                        # checks the form; closes only when it is fine
+                return
+        super().reject()
+
     def done(self, result):
         self.cover_gen += 1                       # ignore a lookup that finishes after closing
         super().done(result)
@@ -2394,7 +2719,7 @@ class BookDialog(QDialog):
         self.accept()
 
     def _delete(self):
-        if self.book and confirm_delete(self, self.book, self.wish):
+        if self.book:                               # no confirmation: the window offers Undo
             self.deleted = True
             self.accept()
 
@@ -2409,149 +2734,6 @@ class BookDialog(QDialog):
                 self.started.iso(), self.finished.iso())
 
 
-# ---------------------------------------------------- delete confirmation
-class DangerBadge(QWidget):
-    """Round red badge with a trash-can icon, drawn with QPainter (no font or image file needed).
-    The red is semi-transparent, so it looks right in both the dark and the light theme."""
-    def __init__(self, size=48):
-        super().__init__()
-        self.setFixedSize(size, size)
-
-    def paintEvent(self, _):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing)
-        s = float(self.width())
-        red = QColor("#e0526a")
-        p.setPen(Qt.NoPen)
-        p.setBrush(QColor(224, 82, 106, 40))
-        p.drawEllipse(QRectF(self.rect()))
-        p.setBrush(Qt.NoBrush)
-        p.setPen(QPen(red, s * 0.055, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
-        pt = lambda x, y: QPointF(s * x, s * y)
-        lid = QPainterPath()
-        lid.moveTo(pt(0.29, 0.34)); lid.lineTo(pt(0.71, 0.34))              # lid
-        lid.moveTo(pt(0.42, 0.34)); lid.lineTo(pt(0.42, 0.28))              # handle
-        lid.lineTo(pt(0.58, 0.28)); lid.lineTo(pt(0.58, 0.34))
-        body = QPainterPath()
-        body.moveTo(pt(0.34, 0.34)); body.lineTo(pt(0.365, 0.70))           # can
-        body.lineTo(pt(0.635, 0.70)); body.lineTo(pt(0.66, 0.34))
-        body.moveTo(pt(0.45, 0.44)); body.lineTo(pt(0.45, 0.60))            # slots
-        body.moveTo(pt(0.55, 0.44)); body.lineTo(pt(0.55, 0.60))
-        p.drawPath(lid)
-        p.drawPath(body)
-
-
-def _join_words(parts):
-    return parts[0] if len(parts) == 1 else ", ".join(parts[:-1]) + " and " + parts[-1]
-
-
-class ConfirmDeleteDialog(QDialog):
-    """Replaces the plain "Delete this book?" box: shows WHICH book (cover, title, author), what
-    will be lost with it, and makes Cancel the default button, so a stray Enter or Esc never deletes."""
-    def __init__(self, parent, book, wish=False):
-        super().__init__(parent)
-        _id, title, author, status, rating, notes, cover, started, finished = book
-        self.setWindowTitle("Remove from wishlist" if wish else "Delete book")
-        self.setWindowFlag(Qt.WindowContextHelpButtonHint, False)
-        self.setModal(True)
-        self.setFixedWidth(460)
-
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(24, 22, 24, 20)
-        lay.setSpacing(16)
-
-        top = QHBoxLayout()
-        top.setSpacing(14)
-        top.addWidget(DangerBadge(), alignment=Qt.AlignTop)
-        col = QVBoxLayout()
-        col.setSpacing(4)
-        head = QLabel("Remove this book from your wishlist?" if wish else "Delete this book?",
-                      objectName="h1")
-        head.setWordWrap(True)
-        col.addWidget(head)
-        sub = QLabel("It will disappear from your wishlist." if wish
-                     else "It will be removed from your library. This can’t be undone.",
-                     objectName="muted")
-        sub.setWordWrap(True)
-        col.addWidget(sub)
-        top.addLayout(col, 1)
-        lay.addLayout(top)
-
-        # the book itself
-        card = QFrame(objectName="row")
-        cl = QHBoxLayout(card)
-        cl.setContentsMargins(12, 12, 14, 12)
-        cl.setSpacing(14)
-        pic = QLabel()
-        pic.setFixedSize(54, 80)
-        pic.setAlignment(Qt.AlignCenter)
-        pm = get_pixmap(cover)
-        if pm:
-            pic.setStyleSheet("background:transparent;")
-            pic.setPixmap(pm.scaled(54, 80, Qt.KeepAspectRatio, Qt.SmoothTransformation))
-        else:
-            c1, c2 = cover_colors(title)
-            pic.setTextFormat(Qt.PlainText)
-            pic.setWordWrap(True)
-            pic.setText(title if len(title) <= 30 else title[:29] + "…")
-            pic.setStyleSheet(
-                "border-radius:6px; color:white; font-size:9px; font-weight:700; padding:3px;"
-                f"background:qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 {c1.name()},stop:1 {c2.name()});")
-        cl.addWidget(pic)
-        info = QVBoxLayout()
-        info.setSpacing(3)
-        t = QLabel(title if len(title) <= 90 else title[:89] + "…", objectName="rowtitle")
-        t.setTextFormat(Qt.PlainText)
-        t.setWordWrap(True)
-        t.setAlignment(align_for(title))
-        info.addStretch()
-        info.addWidget(t)
-        if author:
-            a = QLabel(author, objectName="muted")
-            a.setTextFormat(Qt.PlainText)
-            a.setWordWrap(True)
-            a.setAlignment(align_for(author))
-            info.addWidget(a)
-        meta = " · ".join(x for x in (status,
-                                      f"★ {rating}/5" if rating else "",
-                                      f"Finished {fmt_date(finished)}" if finished else "") if x)
-        if meta:
-            m = QLabel(meta, objectName="muted")
-            m.setTextFormat(Qt.PlainText)
-            m.setWordWrap(True)
-            info.addWidget(m)
-        info.addStretch()
-        cl.addLayout(info, 1)
-        lay.addWidget(card)
-
-        # what is lost together with the book (only what this book really has)
-        lost = [w for w, has in (("rating", rating), ("notes", (notes or "").strip()),
-                                 ("reading dates", started or finished)) if has]
-        if lost:
-            note = QLabel(f"Its {_join_words(lost)} will be deleted too.", objectName="muted")
-            note.setWordWrap(True)
-            lay.addWidget(note)
-
-        row = QHBoxLayout()
-        row.addStretch()
-        cancel = QPushButton("Cancel", objectName="ghost")
-        cancel.setAutoDefault(True)
-        cancel.setDefault(True)                     # Enter = Cancel, Esc = Cancel
-        cancel.clicked.connect(self.reject)
-        ok = QPushButton("Remove" if wish else "Delete book", objectName="dangerfill")
-        ok.setAutoDefault(False)
-        ok.clicked.connect(self.accept)
-        row.addWidget(cancel)
-        row.addWidget(ok)
-        lay.addLayout(row)
-        cancel.setFocus()
-
-
-def confirm_delete(parent, book, wish=False):
-    """book: a row tuple (id,title,author,status,rating,notes,cover,started,finished)."""
-    return bool(ConfirmDeleteDialog(parent, book, wish).exec())
-
-
 # ------------------------------------------------------- online search UI
 class ResultRow(QFrame):
     add = Signal(object)
@@ -2559,7 +2741,6 @@ class ResultRow(QFrame):
     def __init__(self, data, in_library):
         super().__init__(objectName="row")
         self.data = data
-        self.cover_path = None
         lay = QHBoxLayout(self)
         lay.setContentsMargins(10, 10, 14, 10)
         lay.setSpacing(14)
@@ -2599,11 +2780,12 @@ class ResultRow(QFrame):
         self.btn.clicked.connect(lambda: self.add.emit(self))
         lay.addWidget(self.btn)
 
-    def set_cover(self, path):
-        pm = QPixmap(path)
+    def set_preview(self, source):
+        """source: a QImage (downloaded preview) or a file path (the library's own cover). It is only
+        shown here: the book's real cover is fetched when the book is added."""
+        pm = QPixmap.fromImage(source) if isinstance(source, QImage) else QPixmap(source)
         if pm.isNull():
             return
-        self.cover_path = path
         self.cover.setStyleSheet("background:transparent;")
         self.cover.setPixmap(pm.scaled(62, 92, Qt.KeepAspectRatio, Qt.SmoothTransformation))
 
@@ -2726,7 +2908,7 @@ class StatsDialog(QDialog):
         top.addWidget(head)
         top.addStretch()
         self.year_c = QComboBox()
-        self.year_c.addItems([str(y) for y in years])
+        self.year_c.addItems([fa_num(y) for y in years])
         top.addWidget(self.year_c)
         lay.addLayout(top)
 
@@ -2791,7 +2973,7 @@ class StatsDialog(QDialog):
         self.refresh()
 
     def refresh(self, *_):
-        year = int(self.year_c.currentText())
+        year = int(self.year_c.currentText().translate(_DIGITS))
         mine = [r for r in self.rows if year_of(r[4]) == year]
         n, goal = len(mine), self.goal.value()
         self.progress_lbl.setText(f"{n} of {goal} books · {round(100 * n / goal)}%" if goal
@@ -2816,7 +2998,7 @@ class StatsDialog(QDialog):
         self.chart.set_data(months, month_names())
         self.chart_note.setText(
             f"+ {year_only} book{'s' if year_only != 1 else ''} with only the year known "
-            f"(≈ {year}): counted in the yearly total and the goal, but not in this chart."
+            f"(≈ {fa_num(year)}): counted in the yearly total and the goal, but not in this chart."
             if year_only else "")
         top = Counter((r[1] or "Unknown").split(",")[0].strip() for r in mine).most_common(5)
         self.authors.setText("<br>".join(f"{i}. \u2068{html.escape(a)}\u2069 — {c}" for i, (a, c) in enumerate(top, 1))
@@ -2856,11 +3038,13 @@ class DataDialog(QDialog):
         lay.addWidget(self.last)
         for text, fn in (("Back up now", self.backup), ("Restore from a backup…", self.restore),
                          ("Open backup folder", self.open_folder),
-                         ("Import from CSV…", win.import_csv), ("Export to CSV…", win.export_csv),
+                         ("Import from CSV…", lambda: win.import_csv(self)),
+                         ("Export to CSV…", lambda: win.export_csv(self)),
                          ("Settings…", self.settings)):
             b = QPushButton(text, objectName="ghost")
             b.clicked.connect(lambda _=False, f=fn: f())
             lay.addWidget(b)
+        lay.addWidget(QLabel(f"My Books · version {APP_VERSION}", objectName="muted"))
         done = QPushButton("Done", objectName="primary")
         done.clicked.connect(self.accept)
         lay.addWidget(done, alignment=Qt.AlignRight)
@@ -2871,11 +3055,11 @@ class DataDialog(QDialog):
         self.last.setText(f"Latest backup: {files[-1].name}" if files else "No backup yet.")
 
     def backup(self):
-        self.win.backup_now()
+        self.win.backup_now(self)
         self.refresh_last()
 
     def restore(self):
-        self.win.restore_backup()
+        self.win.restore_backup(self)
         self.refresh_last()
 
     def open_folder(self):
@@ -2964,7 +3148,7 @@ class DiscoverDialog(QDialog):
         self.hide_noise.setChecked(True)
         self.hide_noise.toggled.connect(self.render)
         lay.addWidget(self.hide_noise)
-        self.show_covers = CheckBox("Show covers in the results (downloads a picture for each visible result)")
+        self.show_covers = CheckBox("Show covers in the results (a small picture for each visible result)")
         self.show_covers.setChecked(bool(load_settings().get("show_covers", False)))
         self.show_covers.toggled.connect(self.covers_toggled)
         lay.addWidget(self.show_covers)
@@ -3017,7 +3201,7 @@ class DiscoverDialog(QDialog):
         if tag[0] == "search":
             self.show_results(*result)
         elif tag[0] == "cover" and tag[2] < len(self.rows):
-            self.rows[tag[2]].set_cover(result)
+            self.rows[tag[2]].set_preview(result)
 
     def job_failed(self, tag, message):
         if tag[0] == "search" and tag[1] == self.gen:
@@ -3058,14 +3242,22 @@ class DiscoverDialog(QDialog):
                       "from this publisher; the others keep the default cover.")
         self.status.setText(f"{len(shown)} {what} · {sources}{hid}{extra}")
         for i, d in enumerate(shown):
-            row = ResultRow(d, self.store.exists(d["title"]))
+            in_library = self.store.exists(d["title"])
+            row = ResultRow(d, in_library)
             row.add.connect(self.add_book)
             item = QListWidgetItem()
             item.setSizeHint(QSize(0, 116))
             self.results.addItem(item)
             self.results.setItemWidget(item, row)
             self.rows.append(row)
-            self.cover_specs.append(self.cover_spec(d) if self.show_covers.isChecked() else None)
+            spec = None
+            if self.show_covers.isChecked():
+                own = self.store.cover_of(d["title"]) if in_library else None
+                if own and get_pixmap(own):
+                    row.set_preview(str(COVERS_DIR / own))       # already in the library: no download
+                else:
+                    spec = self.preview_spec(d)
+            self.cover_specs.append(spec)
         QTimer.singleShot(0, self.load_visible_covers)      # once the list has been laid out
 
     @staticmethod
@@ -3084,6 +3276,15 @@ class DiscoverDialog(QDialog):
         if self.items:
             self.render()
 
+    @staticmethod
+    def preview_spec(d):
+        """(pool, function, args) that makes this result's small preview, or None without a cover source."""
+        if d.get("cover_urls"):
+            return COVER_POOL, fetch_preview, (d["cover_urls"][0],)
+        if d.get("cover_query") and d["cover_query"][0]:
+            return LOOKUP_POOL, find_preview, tuple(d["cover_query"])      # needs a search: one at a time
+        return None
+
     def load_visible_covers(self):
         """Downloads the covers only for the rows on screen (plus a little ahead), so a search with
         50 results does not fetch 50 pictures nobody looks at. Called after a search, and 0.2 s after
@@ -3095,10 +3296,10 @@ class DiscoverDialog(QDialog):
             if not view.intersects(self.results.visualItemRect(self.results.item(i))):
                 continue
             self.cover_started.add(i)
-            fn, args = spec
+            pool, fn, args = spec
             job = Job(("cover", self.gen, i), self._cover_job, self.gen, fn, *args)
             job.signals.done.connect(self.job_done)
-            COVER_POOL.start(job)
+            pool.start(job)
 
     def resizeEvent(self, e):
         super().resizeEvent(e)
@@ -3123,7 +3324,7 @@ class DiscoverDialog(QDialog):
             if self.store.wish_exists(d["title"]):
                 row.mark_added("In wishlist")
                 return
-            new_id = self.store.wish_add(d["title"], d["author"], "", row.cover_path)
+            new_id = self.store.wish_add(d["title"], d["author"], "", None)
             row.mark_added("Wishlist")
             wish = True
         else:
@@ -3131,12 +3332,12 @@ class DiscoverDialog(QDialog):
                 row.mark_added("In library")
                 return
             new_id = self.store.add(d["title"], d["author"], self.status_c.currentText(),
-                                    None, "", row.cover_path)
+                                    None, "")
             row.mark_added()
             wish = False
         self.changed.emit()
-        spec = None if row.cover_path else self.cover_spec(d)
-        if spec:                                    # no cover downloaded yet: get just this one
+        spec = self.cover_spec(d)
+        if spec:                                    # the real cover is fetched now, only for this book
             COVER_ATTACH["n"] += 1
             job = Job(("attach", new_id, wish), *spec[:1], *spec[1])
             job.signals.done.connect(self._cover_attached)
@@ -3156,7 +3357,216 @@ class DiscoverDialog(QDialog):
         COVER_ATTACH["n"] -= 1                      # no cover found: the book stays as it is
 
 
+class ShelfArt(QWidget):
+    """Little shelf with a few books, drawn with QPainter in the status colours of the chips.
+    Uses the theme colours only for the backdrop and the shelf, so it fits dark and light."""
+    def __init__(self):
+        super().__init__()
+        self.setFixedSize(200, 130)
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setPen(Qt.NoPen)
+        base = 108
+        accent = QColor(T["accent"])
+        accent.setAlpha(28)
+        p.setBrush(accent)
+        p.drawEllipse(QPointF(100, 62), 62, 62)
+        shelf = QColor(T["muted"])
+        shelf.setAlpha(120)
+        p.setBrush(shelf)
+        p.drawRoundedRect(QRectF(28, base, 144, 5), 2.5, 2.5)
+
+        def book(rect, key):
+            p.setBrush(QColor(STATUS_COLORS[key]))
+            p.drawRoundedRect(rect, 3, 3)
+            p.setBrush(QColor(255, 255, 255, 70))                      # two bands on the spine
+            p.drawRect(QRectF(rect.left(), rect.top() + 10, rect.width(), 3))
+            p.drawRect(QRectF(rect.left(), rect.bottom() - 13, rect.width(), 3))
+
+        for x, w, h, key in ((44, 20, 66, "Read"), (66, 16, 54, "Reading"),
+                             (84, 22, 72, "Want to read"), (108, 17, 58, WISH)):
+            book(QRectF(x, base - h, w, h), key)
+        p.save()                                                         # one book leans on the others
+        p.translate(160, base)
+        p.rotate(-14)
+        book(QRectF(-18, -58, 18, 58), "Reading")
+        p.restore()
+
+
+class EmptyState(QWidget):
+    """What the book area shows when there is nothing to list: picture, a short title and sentence,
+    and up to three buttons (the first one is the main action). Window.show_empty fills it in."""
+    def __init__(self):
+        super().__init__()
+        lay = QVBoxLayout(self)
+        lay.setSpacing(10)
+        lay.addStretch(3)
+        lay.addWidget(ShelfArt(), alignment=Qt.AlignHCenter)
+        lay.addSpacing(6)
+        self.title = QLabel("", objectName="h1")
+        self.title.setTextFormat(Qt.PlainText)
+        self.title.setAlignment(Qt.AlignCenter)
+        self.title.setWordWrap(True)
+        lay.addWidget(self.title, alignment=Qt.AlignHCenter)
+        self.sub = QLabel("", objectName="muted")
+        self.sub.setTextFormat(Qt.PlainText)
+        self.sub.setAlignment(Qt.AlignCenter)
+        self.sub.setWordWrap(True)
+        lay.addWidget(self.sub, alignment=Qt.AlignHCenter)
+        lay.addSpacing(8)
+        row = QHBoxLayout()
+        row.setSpacing(10)
+        row.addStretch()
+        self.btns, self._cbs = [], [None, None, None]
+        for i, name in enumerate(("primary", "ghost", "ghost")):
+            b = QPushButton(objectName=name)
+            b.setCursor(Qt.PointingHandCursor)
+            b.clicked.connect(lambda _=False, i=i: self._cbs[i] and self._cbs[i]())
+            row.addWidget(b)
+            self.btns.append(b)
+        row.addStretch()
+        lay.addLayout(row)
+        lay.addStretch(4)
+
+    def set_state(self, title, sub, actions):
+        """actions: [(button text, callback)], at most three."""
+        self.title.setText(title)
+        self.sub.setText(sub)
+        for label, width in ((self.title, 460), (self.sub, 400)):   # wrapped labels need their height set
+            label.setFixedWidth(width)
+            label.setFixedHeight(label.heightForWidth(width))
+        for i, b in enumerate(self.btns):
+            b.setVisible(i < len(actions))
+            self._cbs[i] = actions[i][1] if i < len(actions) else None
+            if i < len(actions):
+                b.setText(actions[i][0])
+
+
+class Toast(QFrame):
+    """Small message that appears at the bottom of its host window and fades away by itself.
+    Replaces the pop-up boxes for success messages (nothing to click away) and carries the Undo
+    button after a delete. One Toast per host; a new message replaces the old one."""
+    closed = Signal()
+
+    def __init__(self, host):
+        super().__init__(host)
+        self.setObjectName("toast")
+        self.host = host
+        self._cb = None                       # action button callback
+        self._hold = False                    # True while the action is an Undo for deleted data
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(18, 10, 10, 10)
+        lay.setSpacing(10)
+        self.label = QLabel()
+        self.label.setTextFormat(Qt.PlainText)
+        self.label.setWordWrap(True)          # long messages (import result) wrap in a narrow dialog
+        self.btn = QPushButton(objectName="toastbtn")
+        self.btn.setCursor(Qt.PointingHandCursor)
+        self.btn.clicked.connect(self._act)
+        lay.addWidget(self.label)
+        lay.addWidget(self.btn)
+        self.fx = QGraphicsOpacityEffect(self)
+        self.fx.setOpacity(0.0)
+        self.setGraphicsEffect(self.fx)
+        self.anim = QPropertyAnimation(self.fx, b"opacity", self)
+        self.anim.setDuration(160)
+        self.anim.finished.connect(self._anim_done)
+        self.timer = QTimer(self)
+        self.timer.setSingleShot(True)
+        self.timer.timeout.connect(self.dismiss)
+        host.installEventFilter(self)
+        self.hide()
+
+    def has_pending(self):
+        """True while an Undo is on offer (deleted data may still come back)."""
+        return self._hold and self.isVisible()
+
+    def popup(self, text, action=None, callback=None, ms=4500, pending=False):
+        had = self._hold
+        self._cb, self._hold = (callback if action else None), bool(action and pending)
+        self.btn.setText(action or "")
+        self.btn.setVisible(bool(action))
+        avail = max(160, min(self.host.width() - 120, 560))
+        fm = self.label.fontMetrics()
+        w = min(fm.horizontalAdvance(text) + 4, avail)
+        h = fm.boundingRect(0, 0, w, 10000, Qt.TextWordWrap, text).height()
+        self.label.setText(text)
+        self.label.setFixedSize(w, h)
+        self.adjustSize()
+        self.place()
+        self.raise_()
+        self.show()
+        self._fade(1.0)
+        self.timer.start(ms)
+        if had and not self._hold:
+            self.closed.emit()                # an Undo offer was replaced by a plain message
+
+    def place(self):
+        self.move(max(8, (self.host.width() - self.width()) // 2), self.host.height() - self.height() - 24)
+
+    def eventFilter(self, obj, e):
+        if obj is self.host and e.type() == QEvent.Resize and self.isVisible():
+            self.adjustSize()
+            self.place()
+        return False
+
+    def _act(self):
+        cb, self._cb = self._cb, None
+        self.dismiss()
+        if cb:
+            cb()
+
+    def dismiss(self):
+        self.timer.stop()
+        self._cb = None
+        self._fade(0.0)
+
+    def _fade(self, to):
+        self.anim.stop()
+        self.anim.setStartValue(self.fx.opacity())
+        self.anim.setEndValue(to)
+        self.anim.start()
+
+    def _anim_done(self):
+        if self.fx.opacity() == 0.0 and self.isVisible():
+            self.hide()
+            self._hold = False
+            self.closed.emit()
+
+
+def toast(host, text, action=None, callback=None, ms=4500, pending=False):
+    """Shows a Toast on `host` (a window or dialog); the Toast is created on first use."""
+    t = getattr(host, "_toast", None)
+    if t is None:
+        t = host._toast = Toast(host)
+    t.popup(text, action, callback, ms, pending)
+    return t
+
+
+def card_tooltip(row):
+    """Full title, author and the start of the notes: the card itself cuts long text."""
+    _id, title, author, status, rating, notes, _c, started, finished = row
+    def block(text, bold=False):
+        t = html.escape(text).replace("\n", "<br>")
+        t = f"<b>{t}</b>" if bold else t
+        return f"<div dir='{'rtl' if is_rtl(text) else 'ltr'}'>{t}</div>"
+    parts = [block(title, True)]
+    if author:
+        parts.append(block(author))
+    note = (notes or "").strip()
+    if note:
+        parts.append(block(note if len(note) <= 240 else note[:239] + "…"))
+    return "".join(parts)
+
+
 # -------------------------------------------------------------- window
+def TOAST_ACCENT():
+    """The toast is the inverse of the theme, so its button uses the OTHER theme's accent colour."""
+    return THEMES["light" if T["bg"] == THEMES["dark"]["bg"] else "dark"]["accent"]
+
+
 def make_qss():
     return f"""
 * {{ color:{T['text']}; }}
@@ -3175,7 +3585,8 @@ QComboBox QAbstractItemView {{ background:{T['card']}; border:1px solid {T['bord
     selection-background-color:{T['accent']}; selection-color:white; outline:none; }}
 QPushButton {{ border:none; border-radius:10px; padding:10px 18px; font-weight:600; }}
 QPushButton#primary {{ background:{T['accent']}; color:white; }}
-QPushButton#primary:hover {{ background:{T['accent']}; opacity:0.9; }}
+QPushButton#primary:hover {{ background:{QColor(T['accent']).lighter(114).name()}; }}
+QPushButton#primary:pressed {{ background:{QColor(T['accent']).darker(112).name()}; }}
 QPushButton#ghost {{ background:{T['input']}; }}
 QPushButton#ghost:hover {{ border:1px solid {T['accent']}; }}
 QPushButton#ghost:focus {{ border:1px solid {T['accent']}; }}
@@ -3192,6 +3603,10 @@ QScrollBar:vertical {{ background:transparent; width:10px; margin:2px; }}
 QScrollBar::handle:vertical {{ background:{T['border']}; border-radius:4px; min-height:30px; }}
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height:0; }}
 QMessageBox {{ background:{T['card']}; }}
+QMessageBox QPushButton {{ background:{T['input']}; min-width:92px; padding:8px 16px; border:1px solid transparent; }}
+QMessageBox QPushButton:hover {{ border:1px solid {T['accent']}; }}
+QMessageBox QPushButton:default {{ background:{T['accent']}; color:white; }}
+QMessageBox QPushButton:default:hover {{ background:{QColor(T['accent']).lighter(114).name()}; }}
 QFrame#row {{ background:{T['bg']}; border:1px solid {T['border']}; border-radius:14px; }}
 QFrame#row QLabel {{ background:transparent; }}
 #rowtitle {{ font-size:15px; font-weight:700; }}
@@ -3221,6 +3636,11 @@ QMenu::separator {{ height:1px; background:{T['border']}; margin:5px 8px; }}
 QPushButton::menu-indicator {{ image:none; width:0; }}
 QFrame#popover {{ background:{T['card']}; border:1px solid {T['border']}; border-radius:12px; }}
 #bignum {{ font-size:26px; font-weight:800; }}
+QFrame#toast {{ background:{T['text']}; border-radius:12px; }}
+QFrame#toast QLabel {{ color:{T['bg']}; background:transparent; }}
+QPushButton#toastbtn {{ background:transparent; color:{TOAST_ACCENT()}; padding:6px 12px; border-radius:8px; font-weight:700; }}
+QPushButton#toastbtn:hover {{ background:rgba(128,128,128,0.22); }}
+QToolTip {{ background:{T['card']}; color:{T['text']}; border:1px solid {T['border']}; padding:6px 8px; }}
 """
 
 
@@ -3229,10 +3649,11 @@ class Window(QWidget):
         super().__init__()
         self.setObjectName("root")
         self.setWindowTitle("My Books")
-        self.resize(1120, 680)
         self.store = Store()
         self.status = "All"
-        self.theme = "dark"
+        cfg = load_settings()
+        self.restore_size(cfg)
+        self.theme = cfg.get("theme") if cfg.get("theme") in THEMES else "dark"   # remembered between runs
         self._tidy_pending = False
 
         outer = QHBoxLayout(self)
@@ -3298,6 +3719,11 @@ class Window(QWidget):
         top.addStretch()
         self.search = QLineEdit(placeholderText="Search title or author...")
         self.search.setFixedWidth(240)
+        self.search_clear = self.search.addAction(clear_icon(), QLineEdit.TrailingPosition)
+        self.search_clear.setToolTip("Clear")
+        self.search_clear.setVisible(False)
+        self.search_clear.triggered.connect(self.search.clear)
+        self.search.textChanged.connect(lambda t: self.search_clear.setVisible(bool(t)))
         self.search.textChanged.connect(self.refresh)
         add = QPushButton("+  Add book", objectName="primary")
         add.setCursor(Qt.PointingHandCursor)
@@ -3305,7 +3731,9 @@ class Window(QWidget):
         self.sort_c = QComboBox()
         self.sort_c.addItems(list(SORTS))
         self.sort_c.setFixedWidth(150)
-        self.sort_c.currentIndexChanged.connect(self.refresh)
+        if cfg.get("sort") in SORTS:
+            self.sort_c.setCurrentText(cfg["sort"])           # before connecting: no refresh yet
+        self.sort_c.currentIndexChanged.connect(self.sort_changed)
         top.addWidget(self.sort_c)
         top.addWidget(self.search)
         online = QPushButton("Find online", objectName="ghost")
@@ -3323,34 +3751,67 @@ class Window(QWidget):
         self.list.setSpacing(4)
         self.list.setMouseTracking(True)
         self.list.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
-        self.list.setItemDelegate(BookDelegate(self.list))
+        self.delegate = BookDelegate(self.list)
+        self.list.setItemDelegate(self.delegate)
         self.list.itemDoubleClicked.connect(self.edit_book)
+        self.list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.list.customContextMenuRequested.connect(self.card_menu)
         QShortcut(QKeySequence("Ctrl+N"), self, self.add_book)
+        QShortcut(QKeySequence("Ctrl+F"), self, self.focus_search)
+        QShortcut(QKeySequence("Ctrl+Z"), self, self.undo_shortcut)
         del_key = QShortcut(QKeySequence(Qt.Key_Delete), self.list)
         del_key.setContext(Qt.WidgetShortcut)
         del_key.activated.connect(self.delete_selected)
         main.addWidget(self.list, 1)
 
-        self.empty = QLabel("No books here yet.\nClick “Add book” to start your shelf.")
-        self.empty.setObjectName("muted")
-        self.empty.setAlignment(Qt.AlignCenter)
-        self.online_btn = QPushButton("Search online instead", objectName="primary")
-        self.online_btn.clicked.connect(lambda: self.open_discover(self.search.text().strip()))
-        self.empty_box = QWidget()
-        eb = QVBoxLayout(self.empty_box)
-        eb.addStretch()
-        eb.addWidget(self.empty)
-        eb.addWidget(self.online_btn, alignment=Qt.AlignHCenter)
-        eb.addStretch()
+        self.empty_box = EmptyState()
         main.addWidget(self.empty_box, 1)
         outer.addLayout(main, 1)
 
+        self._toast = Toast(self)
+        self._toast.closed.connect(self.tidy_covers)   # an Undo offer ended: covers can be swept
         self.apply_theme()
         self.refresh()
         self.auto_backup()
         self.tidy_covers()
 
+    # -- window size
+    def restore_size(self, cfg):
+        """Size (and maximised state) of the last run; a nonsense or too-big value falls back."""
+        w, h = 1120, 680
+        saved = cfg.get("window")
+        if isinstance(saved, list) and len(saved) == 2 and all(isinstance(x, int) for x in saved):
+            screen = QApplication.primaryScreen()
+            avail = screen.availableGeometry() if screen else None
+            w, h = max(760, saved[0]), max(480, saved[1])
+            if avail:
+                w, h = min(w, avail.width()), min(h, avail.height())
+        self.resize(w, h)
+        self.start_maximized = bool(cfg.get("maximized"))
+
+    def closeEvent(self, e):
+        geo = self.normalGeometry() if self.isMaximized() else self.geometry()
+        self.remember(window=[geo.width(), geo.height()], maximized=self.isMaximized())
+        super().closeEvent(e)
+
     # -- behaviour
+    def remember(self, **values):
+        """Saves small UI choices (theme, sort order) in settings.json; a failure never matters."""
+        try:
+            cfg = load_settings()
+            cfg.update(values)
+            save_settings(cfg)
+        except OSError:
+            pass
+
+    def focus_search(self):
+        self.search.setFocus()
+        self.search.selectAll()
+
+    def sort_changed(self, *_):
+        self.remember(sort=self.sort_c.currentText())
+        self.refresh()
+
     def set_status(self, name):
         self.status = name
         self.refresh()
@@ -3360,21 +3821,18 @@ class Window(QWidget):
             rows = self.store.wish_search(self.search.text(), self.sort_c.currentText())
         else:
             rows = self.store.search(self.search.text(), self.status, self.sort_c.currentText())
+        self.delegate.reset()
         self.list.clear()
         for row in rows:
             it = QListWidgetItem()
             it.setData(Qt.UserRole, row)
             it.setSizeHint(QSize(CARD_W, CARD_H))
+            it.setToolTip(card_tooltip(row))
             self.list.addItem(it)
         self.list.setVisible(bool(rows))
         self.empty_box.setVisible(not rows)
-        text = self.search.text().strip()
-        self.online_btn.setVisible(bool(text) and not rows)
-        where = "wishlist" if self.status == WISH else "library"
-        self.empty.setText(f"No match in your {where} for “{text}”." if text and not rows
-                           else "Your wishlist is empty.\nClick “Add book” to note a book you want to buy."
-                           if self.status == WISH
-                           else "No books here yet.\nClick “Add book” to start your shelf.")
+        if not rows:
+            self.show_empty(self.search.text().strip())
         counts = self.store.counts()
         counts[WISH] = self.store.wish_count()
         for name, b in self.nav.items():
@@ -3386,6 +3844,32 @@ class Window(QWidget):
         self.stats.setText(f"Total books: {counts['All']}\n"
                            + (f"Average rating: {avg:.1f} / 5" if avg else "No ratings yet"))
 
+    def show_empty(self, text):
+        """Fills the empty state for what is on screen: a search without hits, an empty wishlist, an
+        empty library, or a status that has no books yet."""
+        where = "wishlist" if self.status == WISH else "library"
+        find = ("Find online", lambda: self.open_discover(self.search.text().strip()))
+        add = ("Add to wishlist" if self.status == WISH else "Add book", self.add_book)
+        hints = {"Read": "Books you have finished will show up here.",
+                 "Reading": "The books you are reading right now will show up here.",
+                 "Want to read": "Books you plan to read will show up here."}
+        if text:
+            short = text if len(text) <= 40 else text[:39] + "…"
+            self.empty_box.set_state(
+                f"No match for “\u2068{short}\u2069”",
+                f"Nothing in your {where} matches this search. Try another spelling, or look for it online.",
+                [("Search online instead", lambda: self.open_discover(self.search.text().strip())),
+                 ("Clear search", self.search.clear)])
+        elif self.status == WISH:
+            self.empty_box.set_state("Your wishlist is empty",
+                                     "Keep track of the books you want to buy later.", [add, find])
+        elif self.status == "All":
+            self.empty_box.set_state("Your shelf is empty",
+                                     "Add your first book, find one online, or import a list you already have.",
+                                     [add, find, ("Import from CSV…", self.import_csv)])
+        else:
+            self.empty_box.set_state(f"Nothing in “{self.status}” yet", hints[self.status], [add, find])
+
     def tidy_covers(self, tries=0):
         """Removes cover files that no book uses (see sweep_unused_covers). It waits until no dialog
         is open and no cover download is running, so it can never delete a picture that is about to
@@ -3394,7 +3878,8 @@ class Window(QWidget):
             return                                  # a check is already waiting
         busy = (QApplication.activeModalWidget() is not None
                 or COVER_POOL.activeThreadCount() > 0 or COVER_ATTACH["n"] > 0
-                or QThreadPool.globalInstance().activeThreadCount() > 0)
+                or QThreadPool.globalInstance().activeThreadCount() > 0
+                or self._toast.has_pending())
         if busy:
             if tries < 120:                         # look again in a second (for up to 2 minutes)
                 self._tidy_pending = True
@@ -3417,6 +3902,9 @@ class Window(QWidget):
             self.tidy_covers()
             return
         d = BookDialog(self, self.store)
+        if self.status in STATUSES:                 # adding from the 'Reading' view starts as Reading
+            d.status_c.setCurrentText(self.status)
+            d.mark_clean()
         if d.exec():
             self.store.add(*d.values())
             self.refresh()
@@ -3427,7 +3915,7 @@ class Window(QWidget):
         if d.exec():
             t, a, n, c = d.wish_values()
             if d.deleted:
-                self.store.wish_delete(book[0])
+                self.remove_book(book, True)
             elif d.bought:
                 self.store.wish_bought(book[0], t, a, n, c)
             else:
@@ -3440,14 +3928,80 @@ class Window(QWidget):
         if self.status == WISH:
             self.edit_wish(book)
             return
+        self.edit_library_book(book)
+
+    def edit_library_book(self, book, preset_status=None):
         d = BookDialog(self, self.store, book)
+        if preset_status:                           # same rules as picking the status in the dialog
+            d.status_c.setCurrentText(preset_status)
+            d.mark_clean()
         if d.exec():
             if d.deleted:
-                self.store.delete(book[0])
+                self.remove_book(book, False)
             else:
                 self.store.update(book[0], *d.values())
             self.refresh()
         self.tidy_covers()
+
+    def quick_status(self, book, target):
+        """Right-click > change status. Fills today's start/finish date like the dialog does. When the
+        dates and the new status do not fit together (e.g. Read -> Reading with a finish date), the
+        edit dialog opens with the new status already chosen, so nothing is lost or decided silently."""
+        bid, title, author, status, rating, notes, cover, started, finished = book
+        if target == status:
+            return
+        today = date.today().isoformat()
+        if target == "Reading" and not started:
+            started = today
+        if target == "Read" and not finished:
+            finished = today
+        if [c for c, _ in check_dates(target, started, finished) if c not in SOFT_CHECKS]:
+            self.edit_library_book(book, preset_status=target)
+            return
+        self.store.update(bid, title, author, target, rating, notes, cover, started, finished)
+        self.refresh()
+
+    def wish_to_library(self, book):
+        bid, title, author, _s, _r, notes, cover, _a, _b = book
+        if self.store.exists(title):
+            QMessageBox.information(self, "Already in your library",
+                                    "A book with this title is already in your library.")
+            return
+        self.store.wish_bought(bid, title, author, notes, cover)
+        self.refresh()
+
+    def card_menu(self, pos):
+        item = self.list.itemAt(pos)
+        if item is None:
+            return
+        self.list.setCurrentItem(item)
+        book = item.data(Qt.UserRole)
+        wish = self.status == WISH
+        menu = QMenu(self.list)
+        menu.setWindowFlags(menu.windowFlags() | Qt.FramelessWindowHint | Qt.NoDropShadowWindowHint)
+        menu.setAttribute(Qt.WA_TranslucentBackground)        # lets the QSS rounded corners show
+        menu.setMinimumWidth(200)
+        menu.addAction("Edit…").setData("edit")
+        if wish:
+            menu.addAction("Bought — move to library").setData("bought")
+        else:
+            labels = {"Read": "Mark as Read", "Reading": "Start reading",
+                      "Want to read": "Move to Want to read"}
+            for st in STATUSES:
+                if st != book[3]:
+                    menu.addAction(labels[st]).setData(st)
+        menu.addSeparator()
+        menu.addAction("Delete…").setData("delete")
+        chosen = menu.exec(self.list.viewport().mapToGlobal(pos))
+        key = chosen.data() if chosen else None            # run it after the menu has closed
+        if key == "edit":
+            self.edit_book(item)
+        elif key == "bought":
+            self.wish_to_library(book)
+        elif key == "delete":
+            self.delete_item(item)
+        elif key in STATUSES:
+            self.quick_status(book, key)
 
     def open_discover(self, query):
         d = DiscoverDialog(self, self.store, query)
@@ -3459,14 +4013,49 @@ class Window(QWidget):
         self.tidy_covers()
 
     def delete_selected(self):
-        item = self.list.currentItem()
-        if item and confirm_delete(self, item.data(Qt.UserRole), self.status == WISH):
-            if self.status == WISH:
-                self.store.wish_delete(item.data(Qt.UserRole)[0])
-            else:
-                self.store.delete(item.data(Qt.UserRole)[0])
+        self.delete_item(self.list.currentItem())
+
+    def delete_item(self, item):
+        if item:
+            self.remove_book(item.data(Qt.UserRole), self.status == WISH)
             self.refresh()
             self.tidy_covers()
+
+    def remove_book(self, book, wish):
+        """Deletes at once and offers Undo for a few seconds (instead of asking first). The row is
+        kept as it was; Undo puts it back with the same id, cover, rating, notes and dates. The cover
+        file stays on disk while the offer is open (tidy_covers waits for it)."""
+        snapshot = tuple(book)
+        (self.store.wish_delete if wish else self.store.delete)(book[0])
+        name = snapshot[1] if len(snapshot[1]) <= 40 else snapshot[1][:39] + "…"
+        where = "wishlist" if wish else "library"
+        self.last_deleted = (snapshot, wish)
+        toast(self, f"“\u2068{name}\u2069” removed from your {where}", "Undo",
+              lambda: self.undo_delete(snapshot, wish), ms=7000, pending=True)
+
+    def undo_delete(self, snapshot=None, wish=None):
+        if snapshot is None:
+            snapshot, wish = getattr(self, "last_deleted", (None, None))
+        if snapshot is None:
+            return
+        self.last_deleted = (None, None)
+        try:
+            if (self.store.wish_exists if wish else self.store.exists)(snapshot[1]):
+                raise ValueError("same title")
+            self.store.restore_row(snapshot, wish)
+        except (ValueError, sqlite3.Error):
+            toast(self, "Couldn’t restore it — a book with this title was added in the meantime.")
+            return
+        self.refresh()
+        toast(self, "Restored")
+
+    def toast_ready(self):
+        t = getattr(self, "_toast", None)
+        return bool(t and t.has_pending())
+
+    def undo_shortcut(self):
+        if self.toast_ready():
+            self.undo_delete()
 
     def open_stats(self):
         StatsDialog(self, self.store).exec()
@@ -3482,15 +4071,18 @@ class Window(QWidget):
         except Exception:
             pass                                    # a failed backup must never stop the app
 
-    def backup_now(self):
+    def backup_now(self, host=None):
+        host = host or self
         try:
             dest = make_backup(self.store, force=True)
         except Exception as e:
-            QMessageBox.warning(self, "Backup failed", str(e))
+            QMessageBox.warning(host, "Backup failed", str(e))
             return
-        QMessageBox.information(self, "Backup saved", f"Saved to:\n{dest}")
+        toast(host, f"Backup saved — {dest.name}" if dest else "A backup was already made a moment ago.",
+              "Open folder" if dest else None, lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(BACKUP_DIR))))
 
-    def restore_backup(self):
+    def restore_backup(self, host=None):
+        host = host or self
         BACKUP_DIR.mkdir(exist_ok=True)
         path, _ = QFileDialog.getOpenFileName(self, "Choose a backup", str(BACKUP_DIR),
                                               "Backups (*.zip)")
@@ -3508,9 +4100,10 @@ class Window(QWidget):
             QMessageBox.warning(self, "Restore failed", str(e))
             return
         self.refresh()
-        QMessageBox.information(self, "Restored", "Your library was restored from the backup.")
+        toast(host, "Your library was restored from the backup.")
 
-    def import_csv(self):
+    def import_csv(self, host=None):
+        host = host or self
         path, _ = QFileDialog.getOpenFileName(self, "Import books from CSV", "",
                                               "CSV files (*.csv)")
         if not path:
@@ -3523,11 +4116,11 @@ class Window(QWidget):
             QMessageBox.warning(self, "Import failed", str(e))
             return
         self.refresh()
-        QMessageBox.information(self, "Import finished",
-                                f"Added: {added}\nAlready in your library: {skipped}\n"
-                                f"Rows without a title: {bad}")
+        toast(host, f"Import finished — {added} added · {skipped} already in your library"
+                    + (f" · {bad} row{'s' if bad != 1 else ''} without a title" if bad else ""), ms=7000)
 
-    def export_csv(self):
+    def export_csv(self, host=None):
+        host = host or self
         path, _ = QFileDialog.getSaveFileName(self, "Export books", "my_books.csv",
                                               "CSV files (*.csv)")
         if not path:
@@ -3535,29 +4128,48 @@ class Window(QWidget):
         with open(path, "w", newline="", encoding="utf-8-sig") as fh:  # opens fine in Excel
             w = csv.writer(fh)
             w.writerow(["Title", "Author", "Status", "Rating", "Started", "Finished", "Notes"])
-            for _id, t, a, st, r, n, _c, d0, d1 in self.store.search("", "All", "Title A–Z"):
+            rows = self.store.search("", "All", "Title A–Z")
+            for _id, t, a, st, r, n, _c, d0, d1 in rows:
                 w.writerow([t, a, st, r or "", csv_date(d0), csv_date(d1), n])
+        toast(host, f"Exported {len(rows)} book{'s' if len(rows) != 1 else ''}")
 
     def toggle_theme(self):
         self.theme = "light" if self.theme == "dark" else "dark"
         self.apply_theme()
+        self.remember(theme=self.theme)
 
     def apply_theme(self):
         T.update(THEMES[self.theme])
         QApplication.instance().setStyleSheet(make_qss())
         self.theme_btn.setText("Light mode" if self.theme == "dark" else "Dark mode")
+        self.search_clear.setIcon(clear_icon())
         self.list.viewport().update()
+
+
+def load_local_fonts():
+    """Loads every .ttf/.otf in a 'fonts' folder next to the app (put Vazirmatn-Regular.ttf and
+    Vazirmatn-Bold.ttf there) so the Persian font works without installing it system-wide.
+    Returns how many font files were loaded."""
+    base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    folder, n = base / "fonts", 0
+    if folder.is_dir():
+        for f in sorted(folder.iterdir()):
+            if f.suffix.lower() in (".ttf", ".otf") and QFontDatabase.addApplicationFont(str(f)) >= 0:
+                n += 1
+    return n
 
 
 def main():
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
+    app.setApplicationVersion(APP_VERSION)
+    load_local_fonts()
     font = QFont()
     font.setFamilies(["Vazirmatn", "Segoe UI", "Tahoma", "Noto Sans", "Arial"])
     font.setPointSize(10)
     app.setFont(font)
     w = Window()
-    w.show()
+    w.showMaximized() if w.start_maximized else w.show()
     sys.exit(app.exec())
 
 

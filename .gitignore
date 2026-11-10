@@ -29,3 +29,7 @@ backups/
 # Operating system files
 .DS_Store
 Thumbs.db
+
+
+# Fonts you download yourself (Vazirmatn has its own licence)
+fonts/
