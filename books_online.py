@@ -1,4 +1,4 @@
-"""My Books - online search with covers, reading dates + statistics, backups, CSV import.
+"""My Books - online search with covers, reading dates + statistics, quotes, backups, CSV import.
 Install:  pip install PySide6
 Run:      python books_online.py
 
@@ -16,6 +16,7 @@ import ipaddress
 import json
 import math
 import os
+import random
 import re
 import shutil
 import sqlite3
@@ -48,10 +49,10 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup, QC
 
 from PySide6.QtCore import QUrl
 from PySide6.QtGui import QDesktopServices
-from PySide6.QtWidgets import (QGraphicsOpacityEffect, QMenu, QProgressBar, QScrollArea,
+from PySide6.QtWidgets import (QCompleter, QGraphicsOpacityEffect, QMenu, QProgressBar, QScrollArea,
                                QSizePolicy)
 
-APP_VERSION = "0.2.0"                # one place to change it for a release (also shown in Data & backup)
+APP_VERSION = "0.3.0"                # one place to change it for a release (also shown in Data & backup)
 DB = os.environ.get("BOOKS_DB", "books.db")
 COVERS_DIR = Path(DB).resolve().parent / "covers"
 BACKUP_DIR = Path(DB).resolve().parent / "backups"
@@ -76,6 +77,7 @@ def user_agent(identify=False):
     return f"MyBooksApp/1.0 ({email})" if email else "MyBooksApp/1.0"
 STATUSES = ["Read", "Reading", "Want to read"]
 WISH = "Want to buy"                # the wishlist: books to buy in the future (own table)
+QUOTES = "Quotes"                    # the quotes section (own table: sentences saved from a book)
 COVER_H = 180                        # height of the cover area on a card
 CARD_W, CARD_H = 190, COVER_H + 150
 # chip colours on the cards (white text on each; they sit on top of the cover, so they do not depend on the theme)
@@ -86,6 +88,13 @@ SORTS = {
     "Title A–Z": "title COLLATE NOCASE ASC",
     "Title Z–A": "title COLLATE NOCASE DESC",
     "Top rated": "COALESCE(rating,0) DESC, id DESC",
+}
+
+QUOTE_SORTS = {
+    "Newest first": "q.id DESC",
+    "Oldest first": "q.id ASC",
+    "By book": "COALESCE(b.title, q.book_title) COLLATE NOCASE ASC, CAST(q.page AS INTEGER) ASC, q.id ASC",
+    "Favorites first": "q.favorite DESC, q.id DESC",
 }
 
 THEMES = {
@@ -348,6 +357,12 @@ class Store:
             """CREATE TABLE IF NOT EXISTS wishlist(
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 title TEXT NOT NULL, author TEXT, notes TEXT, cover TEXT)""")
+        self.con.execute(                                   # quotes: a separate table, books is untouched
+            """CREATE TABLE IF NOT EXISTS quotes(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                book_id INTEGER, book_title TEXT, book_author TEXT,
+                text TEXT NOT NULL, page TEXT, note TEXT,
+                favorite INTEGER DEFAULT 0, created TEXT)""")
         self.con.commit()
 
     # -- wishlist (books to buy)
@@ -372,9 +387,10 @@ class Store:
                          (title, author, notes, cover, id_))
         self.con.commit()
 
-    def restore_row(self, row, wish):
-        """Puts a deleted card back (Undo) with its ORIGINAL id and every field.
-        row: (id,title,author,status,rating,notes,cover,started,finished) as the card grid has it."""
+    def restore_row(self, row, wish, quotes=()):
+        """Puts a deleted card back (Undo) with its ORIGINAL id and every field, and the quotes that
+        were deleted together with it. row: (id,title,author,status,rating,notes,cover,started,finished)
+        as the card grid has it."""
         _id, t, a, st, r, n, c, d0, d1 = row
         with self.con:
             if wish:
@@ -384,6 +400,8 @@ class Store:
                 self.con.execute(
                     "INSERT INTO books(id,title,author,status,rating,notes,cover,started,finished) "
                     "VALUES(?,?,?,?,?,?,?,?,?)", (_id, t, a, st, r, n, c, d0, d1))
+            for q in quotes:
+                self._insert_quote_row(q)
 
     def wish_delete(self, id_):
         self.con.execute("DELETE FROM wishlist WHERE id=?", (id_,))
@@ -425,6 +443,98 @@ class Store:
                 (title, author, "Want to read", None, notes, cover, None, None))
             self.con.execute("DELETE FROM wishlist WHERE id=?", (id_,))
 
+    # -- quotes (sentences saved from a book). Row shape: see the comment above FSI / PDI.
+    Q_SELECT = ("SELECT q.id, q.book_id, COALESCE(b.title, q.book_title, ''), COALESCE(b.author, q.book_author, ''), "
+                "q.text, COALESCE(q.page,''), COALESCE(q.note,''), COALESCE(q.favorite,0), COALESCE(q.created,''), "
+                "b.cover, CASE WHEN b.id IS NULL THEN 1 ELSE 0 END "
+                "FROM quotes q LEFT JOIN books b ON b.id=q.book_id")
+
+    def quote_rows(self, text="", kind="all", book_id=None, sort="Newest first"):
+        where, args = [], []
+        if text:
+            like = f"%{text}%"
+            where.append("(q.text LIKE ? OR q.note LIKE ? OR COALESCE(b.title, q.book_title) LIKE ? "
+                         "OR COALESCE(b.author, q.book_author) LIKE ?)")
+            args += [like] * 4
+        if kind == "fav":
+            where.append("q.favorite=1")
+        elif kind == "book":
+            where.append("q.book_id IS ?")
+            args.append(book_id)
+        sql = self.Q_SELECT + (" WHERE " + " AND ".join(where) if where else "") + " ORDER BY " + QUOTE_SORTS[sort]
+        return self.con.execute(sql, args).fetchall()
+
+    def quote_by_id(self, id_):
+        return self.con.execute(self.Q_SELECT + " WHERE q.id=?", (id_,)).fetchone()
+
+    def quote_at(self, index):
+        return self.con.execute(self.Q_SELECT + " ORDER BY q.id LIMIT 1 OFFSET ?", (index,)).fetchone()
+
+    def quote_count(self):
+        return self.con.execute("SELECT COUNT(*) FROM quotes").fetchone()[0]
+
+    def quote_fav_count(self):
+        return self.con.execute("SELECT COUNT(*) FROM quotes WHERE favorite=1").fetchone()[0]
+
+    def quote_count_for(self, book_id):
+        return self.con.execute("SELECT COUNT(*) FROM quotes WHERE book_id=?", (book_id,)).fetchone()[0]
+
+    def quotes_of_book(self, book_id):
+        return self.con.execute(self.Q_SELECT + " WHERE q.book_id=? ORDER BY q.id", (book_id,)).fetchall()
+
+    def quote_books(self):
+        """[(book_id, title, how many quotes)] of the books that have quotes (the page's filter list)."""
+        return self.con.execute(
+            "SELECT q.book_id, COALESCE(b.title, q.book_title, ''), COUNT(*) FROM quotes q "
+            "LEFT JOIN books b ON b.id=q.book_id GROUP BY q.book_id "
+            "ORDER BY COALESCE(b.title, q.book_title, '') COLLATE NOCASE").fetchall()
+
+    def book_choices(self):
+        return self.con.execute("SELECT id,title,author FROM books ORDER BY title COLLATE NOCASE").fetchall()
+
+    def quote_exists(self, book_id, text, exclude_id=None):
+        """Same book + same words (spaces and line breaks do not count)."""
+        want = " ".join((text or "").split())
+        for id_, t in self.con.execute("SELECT id,text FROM quotes WHERE book_id IS ?", (book_id,)):
+            if id_ != exclude_id and " ".join((t or "").split()) == want:
+                return True
+        return False
+
+    def quote_add(self, book_id, title, author, text, page, note, favorite=0, created=None, commit=True):
+        cur = self.con.execute(
+            "INSERT INTO quotes(book_id,book_title,book_author,text,page,note,favorite,created) "
+            "VALUES(?,?,?,?,?,?,?,?)",
+            (book_id, title, author, text, page, note, 1 if favorite else 0,
+             created or datetime.now().isoformat(timespec="seconds")))
+        if commit:
+            self.con.commit()
+        return cur.lastrowid
+
+    def quote_update(self, id_, book_id, title, author, text, page, note, favorite):
+        self.con.execute(
+            "UPDATE quotes SET book_id=?,book_title=?,book_author=?,text=?,page=?,note=?,favorite=? WHERE id=?",
+            (book_id, title, author, text, page, note, 1 if favorite else 0, id_))
+        self.con.commit()
+
+    def quote_set_fav(self, id_, favorite):
+        self.con.execute("UPDATE quotes SET favorite=? WHERE id=?", (1 if favorite else 0, id_))
+        self.con.commit()
+
+    def quote_delete(self, id_):
+        self.con.execute("DELETE FROM quotes WHERE id=?", (id_,))
+        self.con.commit()
+
+    def _insert_quote_row(self, row):
+        _id, book_id, title, author, text, page, note, fav, created, _c, _o = row
+        self.con.execute(
+            "INSERT INTO quotes(id,book_id,book_title,book_author,text,page,note,favorite,created) "
+            "VALUES(?,?,?,?,?,?,?,?,?)", (_id, book_id, title, author, text, page, note, fav, created))
+
+    def quote_restore(self, row):
+        """Puts a deleted quote back (Undo) with its ORIGINAL id."""
+        with self.con:
+            self._insert_quote_row(row)
+
     def add(self, title, author, status, rating, notes, cover=None, started=None, finished=None):
         cover = Path(cover).name if cover else None         # covers live in the covers/ folder
         cur = self.con.execute(
@@ -441,6 +551,8 @@ class Store:
             "UPDATE books SET title=?,author=?,status=?,rating=?,notes=?,cover=?,"
             "started=?,finished=? WHERE id=?",
             (title, author, status, rating, notes, cover, started, finished, id_))
+        self.con.execute("UPDATE quotes SET book_title=?, book_author=? WHERE book_id=?",
+                         (title, author, id_))        # a quote keeps its book's current name
         self.con.commit()
 
     def count(self):
@@ -456,9 +568,11 @@ class Store:
             "SELECT COUNT(*) FROM books WHERE status='Read' "
             "AND (finished IS NULL OR finished='')").fetchone()[0]
 
-    def delete(self, id_):
-        self.con.execute("DELETE FROM books WHERE id=?", (id_,))
-        self.con.commit()
+    def delete(self, id_, with_quotes=False):
+        with self.con:                              # one transaction: the book and (maybe) its quotes
+            self.con.execute("DELETE FROM books WHERE id=?", (id_,))
+            if with_quotes:
+                self.con.execute("DELETE FROM quotes WHERE book_id=?", (id_,))
 
     def exists(self, title, exclude_id=None):
         row = self.con.execute(
@@ -1060,11 +1174,13 @@ COVER_PREF = {"Taaghche": -1, "Apple Books": 0, "Google Books": 1,       # nices
 YEAR_PREF = ["Wikidata", "Open Library", "Google Books", "Apple Books"]
 
 
-def search_books(query, mode, source, publisher=""):
+def search_books(query, mode, source, publisher="", author=""):
     """Returns (results, notes, info). 'All sources' queries every source at the same
     time and merges the answers; a source that fails only adds a note.
-    publisher (optional, Persian searches): use the cover of that publisher's edition."""
+    publisher (optional, Persian searches): use the cover of that publisher's edition.
+    author (optional, title searches): keep only books written by this author (Persian or Latin name)."""
     publisher = (publisher or "").strip()
+    author = (author or "").strip() if mode == "title" else ""
     notes, info = [], ""
     persian = bool(ARABIC.search(query))
     fa_query = query.strip() if mode == "author" and persian else None
@@ -1077,6 +1193,18 @@ def search_books(query, mode, source, publisher=""):
         if name:
             info, query = f"Searched as: {name}", name
     title_q, hint = split_query(query) if mode == "title" else (query.strip(), "")
+    author_en = None
+    if author:
+        hint = author                                   # the explicit filter wins over "... by X" in the query
+        if ARABIC.search(author):                       # Open Library / Apple / Google need the Latin name
+            try:
+                author_en = wikidata_english_author(author)
+            except ApiError as e:
+                notes.append(f"Wikidata: {e}")
+            hint = author_en or ""                      # unknown: do not send Persian text to those sources
+            if author_en:
+                line = f"Author filter: \u2068{author}\u2069 \u2192 {author_en}"
+                info = f"{info}\n{line}" if info else line
 
     names = list(PROVIDERS) if source == "All sources" else [source]
     if source == "All sources" and not load_settings().get("google_api_key"):
@@ -1178,6 +1306,14 @@ def search_books(query, mode, source, publisher=""):
             exact = any(norm(a) in (nq, norm(fa_query or "")) for a in d["author"].split(","))
             return (not exact, -d.get("pop", 0), norm(d["title"]))
         return sorted(items, key=author_rank)[:50], notes, info
+
+    if author:                        # the AUTHOR filter: books by somebody else are dropped
+        kept = [d for d in items if author_matches(author, d["author"])
+                or (author_en and author_matches(author_en, d["author"]))]
+        if len(kept) < len(items):
+            extra = f"{len(items) - len(kept)} results not written by \u201c\u2068{author}\u2069\u201d were hidden"
+            info = f"{info}\n{extra}" if info else extra
+        items = kept
 
     def rank(d):                      # best matches first
         t = norm(d["title"])
@@ -2254,6 +2390,8 @@ class BookDialog(QDialog):
         self.book_id = book[0] if book else None
         self.book = book                    # the stored row (what a delete would remove)
         self.deleted = False
+        self.quotes_choice = None           # 'delete' / 'keep': what to do with the book's quotes on delete
+        self.quotes_lbl = self.add_quote_btn = None
         self._auto = {}                     # dates filled in by a status change (not typed by the person)
         self.cover_path = None
         self.cover_gen = 0                  # bumped to ignore a lookup that is no longer wanted
@@ -2320,6 +2458,15 @@ class BookDialog(QDialog):
         left.addWidget(self.find_btn)
         left.addWidget(self.more_btn)
         left.addWidget(self.cover_msg)
+        if book and not wish:                           # quotes of this book: count + a shortcut to add one
+            left.addSpacing(6)
+            left.addWidget(divider())
+            self.quotes_lbl = QLabel("", objectName="muted")
+            self.add_quote_btn = QPushButton("Add a quote…", objectName="ghost")
+            self.add_quote_btn.clicked.connect(self._add_quote)
+            left.addWidget(self.quotes_lbl)
+            left.addWidget(self.add_quote_btn)
+            self._refresh_quote_count()
         left.addStretch()
         left_w = QWidget()
         left_w.setLayout(left)
@@ -2462,6 +2609,7 @@ class BookDialog(QDialog):
             chain += list(self.status_c.btns.values()) + [self.stars]
             chain += self.started.focus_chain() + self.finished.focus_chain()
         chain += [self.notes, self.find_btn, self.more_btn]
+        chain += [self.add_quote_btn] if self.add_quote_btn else []
         chain += [b for b in (self.delete_btn, self.bought_btn) if b]
         chain += [self.cancel_btn, self.save_btn]
         for a, b in zip(chain, chain[1:]):
@@ -2718,8 +2866,25 @@ class BookDialog(QDialog):
                 return
         self.accept()
 
+    def _refresh_quote_count(self):
+        n = self.store.quote_count_for(self.book_id)
+        self.quotes_lbl.setText(f"{n} quote{'s' if n != 1 else ''} saved" if n else "No quotes yet")
+
+    def _add_quote(self):
+        win = self.parent()
+        if hasattr(win, "add_quote"):
+            win.add_quote(self.book_id)
+            self._refresh_quote_count()
+
     def _delete(self):
         if self.book:                               # no confirmation: the window offers Undo
+            if not self.wish:                       # ...but a book with quotes asks about them first
+                n = self.store.quote_count_for(self.book_id)
+                if n:
+                    choice = ask_book_quotes(self, self.book[1], n)
+                    if choice is None:
+                        return
+                    self.quotes_choice = choice
             self.deleted = True
             self.accept()
 
@@ -3038,8 +3203,10 @@ class DataDialog(QDialog):
         lay.addWidget(self.last)
         for text, fn in (("Back up now", self.backup), ("Restore from a backup…", self.restore),
                          ("Open backup folder", self.open_folder),
-                         ("Import from CSV…", lambda: win.import_csv(self)),
-                         ("Export to CSV…", lambda: win.export_csv(self)),
+                         ("Import books from CSV…", lambda: win.import_csv(self)),
+                         ("Export books to CSV…", lambda: win.export_csv(self)),
+                         ("Import quotes from CSV…", lambda: win.import_quotes_csv(self)),
+                         ("Export quotes to CSV…", lambda: win.export_quotes_csv(self)),
                          ("Settings…", self.settings)):
             b = QPushButton(text, objectName="ghost")
             b.clicked.connect(lambda _=False, f=fn: f())
@@ -3124,8 +3291,22 @@ class DiscoverDialog(QDialog):
         bar.addWidget(self.q, 1)
         bar.addWidget(go)
         lay.addLayout(bar)
+        lbl_auth, lbl_pub = QLabel("Only by author"), QLabel("Cover from publisher")
+        label_w = max(lbl_auth.sizeHint().width(), lbl_pub.sizeHint().width())
+        lbl_auth.setFixedWidth(label_w)
+        lbl_pub.setFixedWidth(label_w)
+        self.auth = QLineEdit()                         # author filter: title searches only
+        self.auth.setPlaceholderText("optional: only books by this author, e.g. Camus   /   کامو")
+        self.auth.returnPressed.connect(self.search)
+        authrow = QHBoxLayout()
+        authrow.setContentsMargins(0, 0, 0, 0)
+        authrow.addWidget(lbl_auth)
+        authrow.addWidget(self.auth, 1)
+        self.auth_row = QWidget()
+        self.auth_row.setLayout(authrow)
+        lay.addWidget(self.auth_row)
         pubrow = QHBoxLayout()
-        pubrow.addWidget(QLabel("Cover from publisher"))
+        pubrow.addWidget(lbl_pub)
         self.pub = QComboBox()
         self.pub.setEditable(True)                      # type a name, or pick one seen in the results
         self.pub.setInsertPolicy(QComboBox.NoInsert)
@@ -3177,6 +3358,7 @@ class DiscoverDialog(QDialog):
 
     def set_mode(self, key):
         self.mode = key
+        self.auth_row.setVisible(key == "title")        # an author search is already by author
         self.q.setPlaceholderText("e.g. The Stranger by Camus   /   بیگانه" if key == "title"
                                   else "e.g. James Clear   /   آلبر کامو")
 
@@ -3190,7 +3372,7 @@ class DiscoverDialog(QDialog):
         self.status.setText("Searching…")
         self.publisher = self.pub.currentText().strip()
         job = Job(("search", self.gen), search_books, text, self.mode,
-                  self.provider.currentText(), self.publisher)
+                  self.provider.currentText(), self.publisher, self.auth.text().strip())
         job.signals.done.connect(self.job_done)
         job.signals.failed.connect(self.job_failed)
         QThreadPool.globalInstance().start(job)
@@ -3561,6 +3743,1013 @@ def card_tooltip(row):
     return "".join(parts)
 
 
+# ------------------------------------------------------------------ quotes
+# A quote row, as the Quotes page has it (Store.quote_rows):
+#   (id, book_id, book_title, book_author, text, page, note, favorite, created, cover, orphan)
+# orphan = 1 when the book is not in the library any more (its quotes were kept on purpose).
+FSI, PDI = "\u2068", "\u2069"           # isolates: a Persian name inside an English line stays in one piece
+SERIF = ["Georgia", "Palatino Linotype", "Cambria", "Noto Serif", "DejaVu Serif", "Times New Roman"]
+HEART_RED = "#ef4f6b"
+
+
+def heart_path(cx, cy, s):
+    path = QPainterPath()
+    path.moveTo(cx, cy + s * 0.9)
+    path.cubicTo(cx - s * 1.6, cy - s * 0.1, cx - s * 0.7, cy - s * 1.2, cx, cy - s * 0.35)
+    path.cubicTo(cx + s * 0.7, cy - s * 1.2, cx + s * 1.6, cy - s * 0.1, cx, cy + s * 0.9)
+    return path
+
+
+def heart_icon(filled, size=20):
+    """Heart drawn by hand (no font needed), in the current theme's colours."""
+    pm = QPixmap(size * 2, size * 2)
+    pm.setDevicePixelRatio(2)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing)
+    path = heart_path(size / 2, size / 2 + 0.6, size * 0.46)
+    if filled:
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(HEART_RED))
+    else:
+        p.setPen(QPen(QColor(T["muted"]), 1.6, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+        p.setBrush(Qt.NoBrush)
+    p.drawPath(path)
+    p.end()
+    return QIcon(pm)
+
+
+def quote_meta(row, rtl):
+    """'— Author · Book · p. 42' (each part isolated, so Persian and English mix correctly)."""
+    _i, _b, title, author, _t, page, _n, _f, _c, _cv, orphan = row
+    parts = [x for x in (author, title) if x]
+    if orphan:
+        parts.append("book removed")
+    if page:
+        parts.append(("ص " if rtl else "p. ") + page)
+    mark = "\u200f" if rtl else "\u200e"          # RLM / LRM: the line has the same direction as its card
+    return mark + "— " + " · ".join(FSI + x + PDI for x in parts) if parts else ""
+
+
+def quote_citation(row):
+    """“text” — Author, Book (p. 42): what the Copy button puts on the clipboard."""
+    _i, _b, title, author, text, page, *_ = row
+    rtl = is_rtl(text)
+    q = f"«{text}»" if rtl else f"“{text}”"
+    who = ("، " if rtl else ", ").join(x for x in (author, title) if x)
+    if page:
+        pg = f"({'ص' if rtl else 'p.'} {page})"
+        who = f"{who} {pg}" if who else pg
+    return f"{q} — {who}" if who else q
+
+
+def wrap_text(text, font, width, max_lines=None):
+    """Like wrap_lines, but keeps the person's own line breaks (verse) and has no line limit unless
+    max_lines is given; then the last line ends with … when the text is longer."""
+    lines = []
+    for para in (text or "").strip().splitlines() or [""]:
+        lines += wrap_lines(para, font, width, 10 ** 4) or [""]
+    while lines and not lines[-1]:
+        lines.pop()
+    if max_lines and len(lines) > max_lines:
+        last = lines[max_lines - 1]
+        lines = lines[:max_lines]
+        lines[-1] = QFontMetrics(font).elidedText(last + "…", Qt.ElideRight, int(width))
+    return lines
+
+
+def draw_dir_text(p, rect, text, rtl, valign=Qt.AlignVCenter):
+    """One line of text with the right base direction, so a Persian sentence that ends with a full stop
+    keeps the stop on its left side. Alignment is absolute: RTL text hugs the right edge."""
+    p.save()
+    p.setLayoutDirection(Qt.RightToLeft if rtl else Qt.LeftToRight)
+    p.drawText(rect, Qt.AlignAbsolute | (Qt.AlignRight if rtl else Qt.AlignLeft) | valign, text)
+    p.restore()
+
+
+def art_font(rtl, px, bold=False):
+    f = QFont(QApplication.font())
+    if not rtl:
+        f.setFamilies(SERIF)              # Persian text keeps the app font (Vazirmatn when installed)
+    f.setPixelSize(px)
+    f.setBold(bold)
+    return f
+
+
+# ---- the shareable picture
+IMG_ORDER = ["Midnight", "Paper", "Light", "Ocean", "Violet", "Cover"]
+IMG_THEMES = {
+    "Midnight": dict(bg=("#14151b", "#2b2f4a"), text="#ecedf3", muted="#9aa0ba", accent="#7c8cff"),
+    "Paper": dict(bg=("#f6f0e4", "#ece2cc"), text="#2b2a28", muted="#6f675a", accent="#b4532a"),
+    "Light": dict(bg=("#ffffff", "#e9ecfb"), text="#1d2030", muted="#6b7088", accent="#5468ff"),
+    "Ocean": dict(bg=("#0f2027", "#2c5364"), text="#ffffff", muted="#cfe3ea", accent="#6dd5ed"),
+    "Violet": dict(bg=("#3a1c71", "#6a3fd0"), text="#ffffff", muted="#e2d6ff", accent="#ffd36b"),
+}
+IMG_SIZES = {"Square": (1080, 1080), "Story": (1080, 1920), "Wide": (1600, 900)}
+
+
+def img_palette(row, theme):
+    if theme == "Cover":                  # the same two colours the book's card has
+        c1, c2 = cover_colors(row[2] or "book")
+        return dict(bg=(c1.name(), c2.name()), text="#ffffff", muted="#f0ecff", accent="#ffffff")
+    return IMG_THEMES[theme]
+
+
+def render_quote_image(row, theme="Midnight", size="Square"):
+    """The quote as a picture (QImage): big opening mark, the sentence as large as fits, then the
+    author and the book. Only QPainter, no extra library."""
+    _i, _b, title, author, text, page, _n, _f, _c, _cv, _o = row
+    W, H = IMG_SIZES[size]
+    pal = img_palette(row, theme)
+    rtl = is_rtl(text)
+    img = QImage(W, H, QImage.Format_ARGB32_Premultiplied)
+    p = QPainter(img)
+    p.setRenderHints(QPainter.Antialiasing | QPainter.TextAntialiasing | QPainter.SmoothPixmapTransform)
+    grad = QLinearGradient(0, 0, W * 0.6, H)
+    grad.setColorAt(0, QColor(pal["bg"][0]))
+    grad.setColorAt(1, QColor(pal["bg"][1]))
+    p.fillRect(QRectF(0, 0, W, H), grad)
+    short = min(W, H)
+    p.setPen(Qt.NoPen)
+    for alpha, cx, cy, rad in ((26, 0.12 if rtl else 0.88, 0.10, 0.45), (16, 0.90 if rtl else 0.10, 0.95, 0.35)):
+        soft = QColor(pal["accent"])
+        soft.setAlpha(alpha)
+        p.setBrush(soft)
+        p.drawEllipse(QPointF(W * cx, H * cy), short * rad, short * rad)
+
+    m = int(W * 0.09)
+    tw = W - 2 * m
+    mark_px = int(short * 0.2)
+    mf = QFont()
+    mf.setFamilies(SERIF)
+    mf.setPixelSize(mark_px)
+    mf.setBold(True)
+    p.setFont(mf)
+    p.setPen(QColor(pal["accent"]))
+    draw_dir_text(p, QRectF(m, m * 0.6, tw, mark_px * 1.2), "“", rtl, Qt.AlignTop)
+
+    ff, tf = art_font(rtl, int(short * 0.036), True), art_font(rtl, int(short * 0.029))
+    title_line = " · ".join(x for x in (title, (("ص " if rtl else "p. ") + page) if page else "") if x)
+    foot_h = int(short * 0.05) + (QFontMetrics(ff).lineSpacing() if author else 0) \
+        + (QFontMetrics(tf).lineSpacing() if title_line else 0)
+    top = m * 0.6 + mark_px * 0.78
+    bottom = H - m - foot_h
+    avail = max(60, bottom - top - int(short * 0.05))
+
+    px = int(short * 0.072)
+    while True:
+        f = art_font(rtl, px)
+        lh = int(QFontMetrics(f).lineSpacing() * 1.1)
+        lines = wrap_text(text, f, tw)
+        if len(lines) * lh <= avail or px <= 20:
+            break
+        px -= 2
+    fit = max(1, int(avail // lh))
+    if len(lines) > fit:
+        lines = wrap_text(text, f, tw, fit)
+    y = top + max(0, (avail - len(lines) * lh) / 2)
+    p.setFont(f)
+    p.setPen(QColor(pal["text"]))
+    for line in lines:
+        draw_dir_text(p, QRectF(m, y, tw, lh), line, rtl)
+        y += lh
+
+    fy = H - m - foot_h + int(short * 0.012)
+    rule = QRectF(W - m - 64 if rtl else m, fy, 64, 4)
+    p.setPen(Qt.NoPen)
+    p.setBrush(QColor(pal["accent"]))
+    p.drawRoundedRect(rule, 2, 2)
+    fy += 4 + int(short * 0.012)
+    if author:
+        h = QFontMetrics(ff).lineSpacing()
+        p.setFont(ff)
+        p.setPen(QColor(pal["text"]))
+        draw_dir_text(p, QRectF(m, fy, tw, h), QFontMetrics(ff).elidedText(author, Qt.ElideRight, tw), rtl)
+        fy += h
+    if title_line:
+        h = QFontMetrics(tf).lineSpacing()
+        p.setFont(tf)
+        p.setPen(QColor(pal["muted"]))
+        draw_dir_text(p, QRectF(m, fy, tw, h), QFontMetrics(tf).elidedText(title_line, Qt.ElideRight, tw), rtl)
+    p.end()
+    return img
+
+
+# ---- asking what to do with the quotes of a book that is being deleted
+def ask_book_quotes(parent, title, n):
+    """'delete' (the quotes go with the book), 'keep' (the quotes stay) or None (cancel)."""
+    short = title if len(title) <= 50 else title[:49] + "…"
+    many = n != 1
+    box = QMessageBox(QMessageBox.Question, "This book has quotes",
+                      f"“{FSI}{short}{PDI}” has {n} saved quote{'s' if many else ''}.\n\n"
+                      f"What should happen to {'them' if many else 'it'}?",
+                      QMessageBox.NoButton, parent)
+    box.setTextFormat(Qt.PlainText)
+    label = box.findChild(QLabel, "qt_msgbox_label")          # the text, not the icon
+    if label:
+        label.setMinimumWidth(430)                           # wide enough for the three long buttons
+    drop = box.addButton(f"Delete book and quote{'s' if many else ''}", QMessageBox.DestructiveRole)
+    keep = box.addButton("Delete book, keep quotes", QMessageBox.AcceptRole)
+    cancel = box.addButton("Cancel", QMessageBox.RejectRole)
+    box.setDefaultButton(cancel)
+    box.setEscapeButton(cancel)
+    box.exec()
+    clicked = box.clickedButton()
+    return "delete" if clicked is drop else "keep" if clicked is keep else None
+
+
+# ---- CSV
+QALIASES = dict(
+    book=("book", "title", "book title", "عنوان", "کتاب", "نام کتاب"),
+    text=("quote", "quotes", "text", "highlight", "نقل قول", "نقل‌قول", "متن"),
+    page=("page", "page number", "location", "صفحه"),
+    note=("note", "notes", "my note", "یادداشت"),
+    favorite=("favorite", "favourite", "favorites", "مورد علاقه"),
+    date=("date", "created", "date added", "تاریخ"))
+
+
+def csv_pick(row, aliases):
+    for k, v in row.items():
+        if k and k.strip().lower() in aliases:
+            return (v or "").strip()
+    return ""
+
+
+def import_quotes_file(store, path):
+    """Quotes from a CSV (this app's own export, or any file with Book + Quote columns).
+    Returns (added, already_saved, skipped_no_book, rows_without_text, missing_book_titles).
+    All-or-nothing: if anything goes wrong, nothing is added."""
+    books = {norm(t): (i, t, a) for i, t, a in store.book_choices()}
+    added = dup = nobook = bad = 0
+    missing = []
+    with store.con:
+        for row in read_csv_rows(path):
+            text = csv_pick(row, QALIASES["text"])
+            if not text:
+                bad += 1
+                continue
+            title = csv_pick(row, QALIASES["book"])
+            hit = books.get(norm(title))
+            if not hit:
+                nobook += 1
+                if title and title not in missing:
+                    missing.append(title)
+                continue
+            bid, btitle, bauthor = hit
+            if store.quote_exists(bid, text):
+                dup += 1
+                continue
+            fav = csv_pick(row, QALIASES["favorite"]).translate(_DIGITS).lower() in (
+                "1", "true", "yes", "y", "♥", "❤", "✓", "بله")
+            stored = parse_date(csv_pick(row, QALIASES["date"]))
+            iso, prec = split_stored(stored) if stored else ("", "d")
+            store.quote_add(bid, btitle, bauthor, text, csv_pick(row, QALIASES["page"]),
+                            csv_pick(row, QALIASES["note"]), fav,
+                            created=iso if prec == "d" and iso else None, commit=False)
+            added += 1
+    return added, dup, nobook, bad, missing
+
+
+# ---- the card of one quote
+class QuoteCard(QFrame):
+    edit = Signal(object)
+    copy = Signal(object)
+    image = Signal(object)
+    fav = Signal(object)
+    menu = Signal(object, object)
+
+    def __init__(self, row):
+        super().__init__()
+        self.setObjectName("qcard")
+        self.row = row
+        _id, _bid, title, author, text, page, note, fav, created, cover, orphan = row
+        rtl = is_rtl(text)
+        self.setLayoutDirection(Qt.RightToLeft if rtl else Qt.LeftToRight)   # a Persian card mirrors
+        self.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.customContextMenuRequested.connect(lambda pos: self.menu.emit(self.row, self.mapToGlobal(pos)))
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(18, 14, 16, 10)
+        lay.setSpacing(18)
+
+        thumb = QLabel()
+        thumb.setTextFormat(Qt.PlainText)
+        pm = get_pixmap(cover)
+        if pm:
+            small = pm.scaled(56, 84, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            thumb.setPixmap(small)
+            thumb.setFixedSize(small.size())
+        else:
+            c1, c2 = cover_colors(title or "book")
+            thumb.setText(title if len(title) <= 28 else title[:27] + "…")
+            thumb.setWordWrap(True)
+            thumb.setAlignment(Qt.AlignCenter)
+            thumb.setFixedSize(56, 84)
+            thumb.setStyleSheet(
+                "border-radius:6px; color:white; font-size:9px; font-weight:700; padding:4px;"
+                f"background:qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 {c1.name()},stop:1 {c2.name()});")
+        lay.addWidget(thumb, 0, Qt.AlignTop)
+
+        col = QVBoxLayout()
+        col.setContentsMargins(0, 0, 0, 0)
+        col.setSpacing(8)
+        top = QHBoxLayout()
+        top.setContentsMargins(0, 0, 0, 0)
+        mark = QLabel("“", objectName="qmark")
+        mark.setFixedHeight(30)
+        mark.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        top.addWidget(mark)
+        top.addStretch()
+        self.heart = QPushButton(objectName="qheart")
+        self.heart.setCursor(Qt.PointingHandCursor)
+        self.heart.setIconSize(QSize(20, 20))
+        self.heart.clicked.connect(lambda: self.fav.emit(self.row))
+        top.addWidget(self.heart)
+        col.addLayout(top)
+
+        body = QLabel(text, objectName="qtext")
+        body.setTextFormat(Qt.PlainText)
+        body.setWordWrap(True)
+        body.setAlignment(Qt.AlignLeft | Qt.AlignTop)         # "left" = the start side of its own direction
+        col.addWidget(body)
+        meta = quote_meta(row, rtl)
+        if meta:
+            ml = QLabel(meta, objectName="qmeta")
+            ml.setTextFormat(Qt.PlainText)
+            ml.setWordWrap(True)
+            ml.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+            col.addWidget(ml)
+        if note:
+            nl = QLabel(note, objectName="qnote")
+            nl.setTextFormat(Qt.PlainText)
+            nl.setWordWrap(True)
+            nl.setLayoutDirection(Qt.RightToLeft if is_rtl(note) else Qt.LeftToRight)
+            if is_rtl(note):
+                nl.setStyleSheet("font-style:normal;")      # Persian script is not set in italics
+            nl.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+            col.addWidget(nl)
+
+        acts = QHBoxLayout()
+        acts.setContentsMargins(0, 2, 0, 0)
+        acts.setSpacing(2)
+        for label, sig, tip in (("Copy", self.copy, "Copy the quote with its author and book"),
+                                ("Image", self.image, "Make a picture of this quote to share"),
+                                ("Edit", self.edit, "Edit this quote")):
+            b = QPushButton(label, objectName="qaction")
+            b.setCursor(Qt.PointingHandCursor)
+            b.setToolTip(tip)
+            b.clicked.connect(lambda _=False, s=sig: s.emit(self.row))
+            acts.addWidget(b)
+        acts.addStretch()
+        try:
+            when = fmt_date(created[:10]) if created else ""
+        except Exception:
+            when = ""
+        acts.addWidget(QLabel(when, objectName="qdate"))
+        col.addLayout(acts)
+        lay.addLayout(col, 1)
+        self.set_fav(fav)
+
+    def set_fav(self, value):
+        value = 1 if value else 0
+        self.row = self.row[:7] + (value,) + self.row[8:]
+        self.heart.setIcon(heart_icon(bool(value)))
+        self.heart.setToolTip("Remove from favorites" if value else "Add to favorites")
+
+    def mouseDoubleClickEvent(self, e):
+        self.edit.emit(self.row)
+
+
+class QuoteHero(QFrame):
+    """'Quote of the day': one big card at the top of the Quotes page. The gradient is the same two
+    colours the book's own card has, the cover (when there is one) sits on the other side."""
+    copy = Signal(object)
+    image = Signal(object)
+    another = Signal()
+    H = 270
+
+    def __init__(self):
+        super().__init__()
+        self.row = None
+        self.setFixedHeight(self.H)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(30, 0, 30, 20)
+        lay.addStretch()
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        self.copy_b = QPushButton("Copy", objectName="herobtn")
+        self.image_b = QPushButton("Make image", objectName="herobtn")
+        self.next_b = QPushButton("Another", objectName="herobtn")
+        for b in (self.copy_b, self.image_b, self.next_b):
+            b.setCursor(Qt.PointingHandCursor)
+        self.copy_b.clicked.connect(lambda: self.row and self.copy.emit(self.row))
+        self.image_b.clicked.connect(lambda: self.row and self.image.emit(self.row))
+        self.next_b.clicked.connect(self.another.emit)
+        row.addWidget(self.copy_b)
+        row.addWidget(self.image_b)
+        row.addStretch()
+        row.addWidget(self.next_b)
+        lay.addLayout(row)
+
+    def set_row(self, row, can_shuffle=True):
+        self.row = row
+        self.next_b.setVisible(can_shuffle)
+        self.update()
+
+    def paintEvent(self, _):
+        if not self.row:
+            return
+        _i, _b, title, author, text, page, _n, _f, _c, cover, _o = self.row
+        rtl = is_rtl(text)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setRenderHint(QPainter.TextAntialiasing)
+        p.setRenderHint(QPainter.SmoothPixmapTransform)
+        r = QRectF(self.rect()).adjusted(1, 1, -1, -1)
+        clip = QPainterPath()
+        clip.addRoundedRect(r, 20, 20)
+        p.setClipPath(clip)
+        c1, c2 = cover_colors(title or "book")
+        grad = QLinearGradient(r.topLeft(), r.bottomRight())
+        grad.setColorAt(0, c1)
+        grad.setColorAt(1, c2)
+        p.fillRect(r, grad)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(255, 255, 255, 26))
+        p.drawEllipse(QPointF(r.left() + 30 if rtl else r.right() - 30, r.top() + 10), 150, 150)
+        p.setBrush(QColor(0, 0, 0, 30))
+        p.drawEllipse(QPointF(r.right() - 20 if rtl else r.left() + 20, r.bottom()), 120, 120)
+
+        mf = QFont()
+        mf.setFamilies(SERIF)
+        mf.setPixelSize(130)
+        mf.setBold(True)
+        p.setFont(mf)
+        p.setPen(QColor(255, 255, 255, 46))
+        draw_dir_text(p, QRectF(r.left() + 26, r.top() - 6, r.width() - 52, 130), "“", rtl, Qt.AlignTop)
+
+        pm = get_pixmap(cover)
+        side = 156 if pm else 0
+        if pm:
+            area = QRectF(r.left() + 22 if rtl else r.right() - side - 6, r.top() + 26, side, r.height() - 26 - 76)
+            draw_book_cover(p, area, pm, vpad=12, hpad=30)
+        x0 = r.left() + 32 + (side if rtl else 0)
+        tw = r.width() - 64 - side
+
+        lf = QFont(self.font())
+        lf.setPixelSize(12)
+        lf.setBold(True)
+        p.setFont(lf)
+        p.setPen(QColor(255, 255, 255, 205))
+        draw_dir_text(p, QRectF(x0, r.top() + 20, tw, 18), "Quote of the day", rtl)
+
+        f = art_font(rtl, 20)
+        lh = int(QFontMetrics(f).lineSpacing() * 1.12)
+        top, bottom = r.top() + 52, r.bottom() - 108
+        lines = wrap_text(text, f, tw, max(2, int((bottom - top) // lh)))
+        p.setFont(f)
+        p.setPen(QColor("white"))
+        y = top
+        for line in lines:
+            draw_dir_text(p, QRectF(x0, y, tw, lh), line, rtl)
+            y += lh
+        meta = quote_meta(self.row, rtl)
+        if meta:
+            mf2 = QFont(self.font())
+            mf2.setPixelSize(13)
+            mf2.setBold(True)
+            p.setFont(mf2)
+            p.setPen(QColor(255, 255, 255, 225))
+            draw_dir_text(p, QRectF(x0, r.bottom() - 98, tw, 22),
+                          QFontMetrics(mf2).elidedText(meta, Qt.ElideRight, int(tw)), rtl)
+
+
+class QuotesPage(QWidget):
+    """The Quotes section: the quote of the day, a filter + sort bar, and one card per quote.
+    Cards are built a few at a time so even a long list never freezes the window."""
+    CHUNK = 20
+
+    def __init__(self, win):
+        super().__init__()
+        self.win = win
+        self.gen = 0                          # bumped on every reload: a half-built older list stops
+        self.cards, self.count = [], 0
+        self.hero_id, self._key = None, None
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(12)
+        bar = QHBoxLayout()
+        bar.setSpacing(10)
+        self.filter_c = QComboBox()
+        self.filter_c.setMinimumWidth(230)
+        self.filter_c.setMaximumWidth(380)
+        self.sort_c = QComboBox()
+        self.sort_c.addItems(list(QUOTE_SORTS))
+        self.sort_c.setFixedWidth(150)
+        if load_settings().get("quote_sort") in QUOTE_SORTS:
+            self.sort_c.setCurrentText(load_settings()["quote_sort"])
+        bar.addWidget(self.filter_c)
+        bar.addStretch()
+        bar.addWidget(self.sort_c)
+        lay.addLayout(bar)
+
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QFrame.NoFrame)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        body = QWidget(objectName="qbody")
+        body.setAutoFillBackground(False)
+        self.scroll.setWidget(body)
+        self.scroll.viewport().setAutoFillBackground(False)
+        self.vl = QVBoxLayout(body)
+        self.vl.setContentsMargins(2, 2, 10, 16)
+        self.vl.setSpacing(14)
+        self.hero = QuoteHero()
+        self.hero.copy.connect(win.copy_quote)
+        self.hero.image.connect(win.quote_image)
+        self.hero.another.connect(self.another)
+        self.vl.addWidget(self.hero)
+        self.vl.addStretch(1)
+        lay.addWidget(self.scroll, 1)
+        self.empty = EmptyState()
+        lay.addWidget(self.empty, 1)
+        self.empty.hide()
+        self.filter_c.currentIndexChanged.connect(lambda *_: win.refresh())
+        self.sort_c.currentIndexChanged.connect(self._sort_changed)
+
+    def _sort_changed(self, *_):
+        self.win.remember(quote_sort=self.sort_c.currentText())
+        self.win.refresh()
+
+    # -- filter
+    def reload_filters(self):
+        s = self.win.store
+        cur = self.filter_c.currentData() or "all"
+        self.filter_c.blockSignals(True)
+        self.filter_c.clear()
+        self.filter_c.addItem(f"All quotes ({s.quote_count()})", "all")
+        self.filter_c.addItem(f"Favorites ({s.quote_fav_count()})", "fav")
+        for bid, title, n in s.quote_books():
+            self.filter_c.addItem(f"{FSI}{title}{PDI} ({n})", f"b:{bid}")
+        i = self.filter_c.findData(cur)
+        self.filter_c.setCurrentIndex(i if i >= 0 else 0)
+        self.filter_c.blockSignals(False)
+
+    def current_filter(self):
+        data = self.filter_c.currentData() or "all"
+        return ("book", int(data[2:])) if data.startswith("b:") else (data, None)
+
+    def filter_book_id(self):
+        kind, bid = self.current_filter()
+        return bid if kind == "book" else None
+
+    # -- quote of the day
+    def _hero_row(self):
+        s = self.win.store
+        row = s.quote_by_id(self.hero_id) if self.hero_id else None
+        if not row:
+            n = s.quote_count()
+            if not n:
+                return None
+            row = s.quote_at(random.Random(date.today().isoformat()).randrange(n))   # same all day
+            self.hero_id = row[0] if row else None
+        return row
+
+    def another(self):
+        s = self.win.store
+        n = s.quote_count()
+        for _ in range(20):
+            row = s.quote_at(random.randrange(n))
+            if row and row[0] != self.hero_id:
+                self.hero_id = row[0]
+                self.hero.set_row(row, n > 1)
+                return
+
+    # -- building the list
+    def _clear(self):
+        for c in self.cards:
+            self.vl.removeWidget(c)
+            c.setParent(None)
+            c.deleteLater()
+        self.cards = []
+
+    def reload(self):
+        win, s = self.win, self.win.store
+        self.reload_filters()
+        text = win.search.text().strip()
+        kind, book_id = self.current_filter()
+        sort = self.sort_c.currentText()
+        key = (text, kind, book_id, sort)
+        keep = self.scroll.verticalScrollBar().value() if key == self._key else 0   # same list: stay put
+        self._key = key
+        rows = s.quote_rows(text, kind, book_id, sort)
+        self.count = len(rows)
+        self.gen += 1
+        self._clear()
+        if not rows:
+            self.scroll.hide()
+            self.empty.show()
+            self.hero.hide()
+            short = text if len(text) <= 40 else text[:39] + "…"
+            if text:
+                self.empty.set_state(f"No match for “{FSI}{short}{PDI}”",
+                                     "No quote, note, book or author contains this. Try another word.",
+                                     [("Clear search", win.search.clear)])
+            elif kind == "fav":
+                self.empty.set_state("No favorites yet", "Tap the heart on a quote to keep it here.",
+                                     [("Show all quotes", lambda: self.filter_c.setCurrentIndex(0))])
+            else:
+                self.empty.set_state("No quotes yet",
+                                     "Save the sentences you love from your books, with the page and your own note.",
+                                     [("Add quote", win.add_quote), ("Import from CSV…", win.import_quotes_csv)])
+            return
+        self.empty.hide()
+        self.scroll.show()
+        hero = self._hero_row() if (not text and kind == "all") else None
+        if hero:
+            self.hero.set_row(hero, s.quote_count() > 1)
+        self.hero.setVisible(bool(hero))
+        self._chunk(self.gen, rows, 0, keep)
+
+    def _chunk(self, gen, rows, i, keep):
+        if gen != self.gen:
+            return
+        for row in rows[i:i + self.CHUNK]:
+            card = QuoteCard(row)
+            card.edit.connect(self.win.edit_quote)
+            card.copy.connect(self.win.copy_quote)
+            card.image.connect(self.win.quote_image)
+            card.menu.connect(self.win.quote_menu)
+            card.fav.connect(lambda _row, c=card: self._fav(c))
+            self.vl.insertWidget(self.vl.count() - 1, card)
+            self.cards.append(card)
+        i += self.CHUNK
+        if i < len(rows):
+            QTimer.singleShot(0, lambda: self._chunk(gen, rows, i, keep))
+        elif keep:
+            QTimer.singleShot(0, lambda: self.scroll.verticalScrollBar().setValue(keep))
+
+    def _fav(self, card):
+        """The heart changes only that card (no rebuild, so the scroll position stays)."""
+        new = 0 if card.row[7] else 1
+        self.win.store.quote_set_fav(card.row[0], new)
+        card.set_fav(new)
+        if self.hero.row and self.hero.row[0] == card.row[0]:
+            self.hero.row = self.hero.row[:7] + (new,) + self.hero.row[8:]
+        self.reload_filters()                 # the 'Favorites (n)' count
+
+    def theme_changed(self):
+        if self.isVisible():
+            self.reload()
+
+
+# ---- add / edit one quote
+class QuoteDialog(QDialog):
+    """Add / edit one quote. 'Save & add another' keeps the book and the page, so a whole evening of
+    sentences from one book can be typed in a row."""
+
+    def __init__(self, parent, store, quote=None, book_id=None, page="", saved=0):
+        super().__init__(parent)
+        self.store, self.quote = store, quote
+        self.quote_id = quote[0] if quote else None
+        self.orphan = bool(quote and quote[10])
+        self.deleted = self.again = False
+        self.setWindowTitle("Edit quote" if quote else "Add a quote")
+        self.setWindowFlag(Qt.WindowContextHelpButtonHint, False)
+        self.setMinimumWidth(620)
+        self.resize(680, 650)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        head_w = QWidget()
+        hl = QVBoxLayout(head_w)
+        hl.setContentsMargins(28, 22, 28, 16)
+        hl.setSpacing(2)
+        hl.addWidget(QLabel("Edit quote" if quote else "New quote", objectName="h1"))
+        hl.addWidget(QLabel("Change the sentence, its page or your note." if quote
+                            else (f"{saved} saved so far. Type the next one." if saved
+                                  else "Write or paste a sentence you love. Each quote is saved on its own."),
+                            objectName="muted"))
+        root.addWidget(head_w)
+        root.addWidget(divider())
+
+        body = QWidget()
+        bl = QVBoxLayout(body)
+        bl.setContentsMargins(28, 18, 28, 14)
+        bl.setSpacing(16)
+        self.text_e = QTextEdit()
+        self.text_e.setAcceptRichText(False)
+        self.text_e.setFixedHeight(150)
+        self.text_e.setPlaceholderText("Type or paste the sentence…")
+        f = self.text_e.font()
+        f.setPointSize(f.pointSize() + 2)
+        self.text_e.setFont(f)
+        self.text_err = QLabel("", objectName="ferror")
+        self.text_err.setWordWrap(True)
+        self.text_err.setVisible(False)
+        text_box = labeled("Quote", self.text_e, "required")
+        text_box.layout().addWidget(self.text_err)
+        bl.addWidget(text_box)
+
+        self.book_c = QComboBox()
+        self.book_c.setEditable(True)
+        self.book_c.setInsertPolicy(QComboBox.NoInsert)
+        self.book_c.lineEdit().setPlaceholderText("Choose a book from your library…")
+        self.book_c.lineEdit().setStyleSheet("background:transparent; border:none; padding:0;")
+        self._books = {}
+        for bid, t, a in store.book_choices():
+            self.book_c.addItem(t, bid)
+            self._books[bid] = (t, a)
+        comp = self.book_c.completer()                       # typing finds the book anywhere in its title
+        comp.setFilterMode(Qt.MatchContains)
+        comp.setCaseSensitivity(Qt.CaseInsensitive)
+        comp.setCompletionMode(QCompleter.PopupCompletion)
+        comp.popup().setStyleSheet(
+            f"QListView {{ background:{T['card']}; color:{T['text']}; border:1px solid {T['border']}; "
+            f"selection-background-color:{T['accent']}; selection-color:white; outline:none; padding:4px; }}")
+        self.book_c.setCurrentIndex(-1)
+        self._orphan_title = ""
+        want = quote[1] if quote else book_id
+        i = self.book_c.findData(want) if want is not None else -1
+        if i >= 0:
+            self.book_c.setCurrentIndex(i)
+        elif self.orphan:                                    # its book was deleted: keep showing the old title
+            self._orphan_title = quote[2]
+            self.book_c.setEditText(quote[2])
+        self.book_err = QLabel("", objectName="ferror")
+        self.book_err.setWordWrap(True)
+        self.book_err.setVisible(False)
+        book_box = labeled("Book", self.book_c, "required")
+        book_box.layout().addWidget(self.book_err)
+        self.page_e = QLineEdit(page or (quote[5] if quote else ""))
+        self.page_e.setFixedWidth(120)
+        self.page_e.setPlaceholderText("e.g. 42")
+        row = QHBoxLayout()
+        row.setSpacing(14)
+        row.addWidget(book_box, 1)
+        row.addWidget(labeled("Page", self.page_e, "optional"), 0, Qt.AlignTop)
+        bl.addLayout(row)
+
+        self.note_e = QTextEdit()
+        self.note_e.setAcceptRichText(False)
+        self.note_e.setFixedHeight(84)
+        self.note_e.setPlaceholderText("Why it matters to you, what it made you think…")
+        bl.addWidget(labeled("My note", self.note_e, "optional"))
+        self.fav_b = QPushButton("Favorite", objectName="ghost")
+        self.fav_b.setCheckable(True)
+        self.fav_b.setIconSize(QSize(18, 18))
+        self.fav_b.setIcon(heart_icon(False))
+        self.fav_b.toggled.connect(lambda on: self.fav_b.setIcon(heart_icon(on)))
+        frow = QHBoxLayout()
+        frow.addWidget(self.fav_b)
+        frow.addStretch()
+        bl.addLayout(frow)
+        bl.addStretch()
+        root.addWidget(body, 1)
+
+        root.addWidget(divider())
+        foot_w = QWidget()
+        foot = QHBoxLayout(foot_w)
+        foot.setContentsMargins(28, 14, 28, 16)
+        foot.setSpacing(10)
+        self.delete_btn = None
+        if quote:
+            self.delete_btn = QPushButton("Delete", objectName="danger")
+            self.delete_btn.clicked.connect(self._delete)
+            foot.addWidget(self.delete_btn)
+        foot.addStretch()
+        self.cancel_btn = QPushButton("Cancel", objectName="ghost")
+        self.cancel_btn.clicked.connect(self.reject)
+        foot.addWidget(self.cancel_btn)
+        self.again_btn = None
+        if not quote:
+            self.again_btn = QPushButton("Save && add another", objectName="ghost")
+            self.again_btn.clicked.connect(lambda: self._save(True))
+            self.again_btn.setToolTip("Ctrl+Shift+Enter")
+            foot.addWidget(self.again_btn)
+        self.save_btn = QPushButton("Save changes" if quote else "Add quote", objectName="primary")
+        self.save_btn.clicked.connect(lambda: self._save(False))
+        self.save_btn.setToolTip("Ctrl+Enter")
+        foot.addWidget(self.save_btn)
+        root.addWidget(foot_w)
+        for b in self.findChildren(QPushButton):
+            b.setAutoDefault(False)
+        for seq in ("Ctrl+Return", "Ctrl+Enter"):
+            QShortcut(QKeySequence(seq), self, lambda: self._save(False))
+        if not quote:
+            QShortcut(QKeySequence("Ctrl+Shift+Return"), self, lambda: self._save(True))
+
+        if quote:
+            self.text_e.setPlainText(quote[4])
+            self.note_e.setPlainText(quote[6])
+            self.fav_b.setChecked(bool(quote[7]))
+        self.text_e.textChanged.connect(lambda: self._edited(self.text_e))
+        self.note_e.textChanged.connect(lambda: self._direction(self.note_e))
+        self.book_c.editTextChanged.connect(lambda *_: self._set_error(self.book_c, self.book_err, ""))
+        self._direction(self.text_e)
+        self._direction(self.note_e)
+
+        chain = [self.text_e, self.book_c, self.page_e, self.note_e, self.fav_b]
+        chain += [b for b in (self.delete_btn, self.cancel_btn, self.again_btn, self.save_btn) if b]
+        for a, b in zip(chain, chain[1:]):
+            QWidget.setTabOrder(a, b)
+        self.text_e.setFocus()
+        self._clean = self._state()
+
+    # -- small helpers
+    @staticmethod
+    def _direction(edit):
+        edit.setLayoutDirection(Qt.RightToLeft if is_rtl(edit.toPlainText()) else Qt.LeftToRight)
+
+    def _edited(self, edit):
+        self._direction(edit)
+        self._set_error(self.text_e, self.text_err, "")
+
+    @staticmethod
+    def _set_error(widget, label, message):
+        label.setText(message)
+        label.setVisible(bool(message))
+        widget.setProperty("invalid", bool(message))
+        widget.style().unpolish(widget)
+        widget.style().polish(widget)
+
+    def book_id_value(self):
+        t = self.book_c.currentText().strip()
+        i = self.book_c.findText(t, Qt.MatchFixedString) if t else -1
+        if i >= 0:
+            return self.book_c.itemData(i)
+        if self.orphan and t and t == self._orphan_title:
+            return self.quote[1]                             # keeps the old (removed) book as it is
+        return None
+
+    def values(self):
+        bid = self.book_id_value()
+        if bid in self._books:
+            title, author = self._books[bid]
+        elif self.quote:
+            title, author = self.quote[2], self.quote[3]
+        else:
+            title = author = ""
+        return (bid, title, author, self.text_e.toPlainText().strip(), self.page_e.text().strip(),
+                self.note_e.toPlainText().strip(), 1 if self.fav_b.isChecked() else 0)
+
+    def _state(self):
+        return (self.text_e.toPlainText().strip(), self.book_c.currentText().strip(),
+                self.page_e.text().strip(), self.note_e.toPlainText().strip(), self.fav_b.isChecked())
+
+    def is_dirty(self):
+        return self._state() != self._clean
+
+    # -- actions
+    def _save(self, again=False):
+        text = self.text_e.toPlainText().strip()
+        bid = self.book_id_value()
+        tmsg = "Write the quote first." if not text else ""
+        bmsg = ""
+        if bid is None:
+            bmsg = ("Choose a book from your library." if self._books
+                    else "Add a book to your library first.")
+        elif text and self.store.quote_exists(bid, text, self.quote_id):
+            tmsg = "This quote is already saved for this book."
+        self._set_error(self.text_e, self.text_err, tmsg)
+        self._set_error(self.book_c, self.book_err, bmsg)
+        if tmsg:
+            self.text_e.setFocus()
+        elif bmsg:
+            self.book_c.setFocus()
+        if tmsg or bmsg:
+            return
+        self.again = bool(again)
+        self.accept()
+
+    def _delete(self):
+        if self.quote:                                       # no question: the window offers Undo
+            self.deleted = True
+            self.accept()
+
+    def reject(self):
+        if self.is_dirty():
+            adding = self.quote is None
+            box = QMessageBox(QMessageBox.Question,
+                              "Discard this new quote?" if adding else "Discard your changes?",
+                              "This quote hasn’t been saved yet." if adding
+                              else "You have unsaved changes to this quote.", QMessageBox.NoButton, self)
+            save = box.addButton(self.save_btn.text(), QMessageBox.AcceptRole)
+            drop = box.addButton("Discard", QMessageBox.DestructiveRole)
+            keep = box.addButton("Keep editing", QMessageBox.RejectRole)
+            box.setDefaultButton(keep)
+            box.setEscapeButton(keep)
+            box.exec()
+            clicked = box.clickedButton()
+            if clicked is save:
+                self._save()
+                return
+            if clicked is not drop:
+                return
+        super().reject()
+
+
+# ---- the picture dialog
+class QuoteImageDialog(QDialog):
+    PREV = 440
+
+    def __init__(self, parent, row):
+        super().__init__(parent)
+        self.row = row
+        self.theme, self.size_key = IMG_ORDER[0], "Square"
+        self.img = None
+        self.setWindowTitle("Quote image")
+        self.setWindowFlag(Qt.WindowContextHelpButtonHint, False)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(24, 22, 24, 20)
+        lay.setSpacing(24)
+        self.prev = QLabel()
+        self.prev.setFixedSize(self.PREV, self.PREV)
+        self.prev.setAlignment(Qt.AlignCenter)
+        lay.addWidget(self.prev)
+        side = QVBoxLayout()
+        side.setSpacing(14)
+        side.addWidget(QLabel("Quote image", objectName="h1"))
+        hint = QLabel("Pick a style and a size, then save the picture or copy it.", objectName="muted")
+        hint.setWordWrap(True)
+        side.addWidget(hint)
+        swatches = QWidget()
+        sw = QHBoxLayout(swatches)
+        sw.setContentsMargins(0, 0, 0, 0)
+        sw.setSpacing(8)
+        group = QButtonGroup(self)
+        group.setExclusive(True)
+        for name in IMG_ORDER:
+            pal = img_palette(row, name)
+            b = QPushButton()
+            b.setCheckable(True)
+            b.setChecked(name == self.theme)
+            b.setFixedSize(36, 36)
+            b.setCursor(Qt.PointingHandCursor)
+            b.setToolTip(name)
+            b.setStyleSheet(
+                f"QPushButton {{ border-radius:18px; padding:0; border:3px solid {T['border']};"
+                f"background:qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 {pal['bg'][0]},stop:1 {pal['bg'][1]}); }}"
+                f"QPushButton:hover {{ border:3px solid {T['muted']}; }}"
+                f"QPushButton:checked {{ border:3px solid {T['accent']}; }}")
+            b.clicked.connect(lambda _=False, n=name: self._pick_theme(n))
+            group.addButton(b)
+            sw.addWidget(b)
+        sw.addStretch()
+        side.addWidget(labeled("Style", swatches))
+        self.size_c = SegmentedChoice(list(IMG_SIZES))
+        self.size_c.currentTextChanged.connect(self._pick_size)
+        side.addWidget(labeled("Size", self.size_c))
+        self.info = QLabel("", objectName="muted")
+        side.addWidget(self.info)
+        side.addStretch()
+        copy_b = QPushButton("Copy image", objectName="ghost")
+        copy_b.clicked.connect(self.copy_image)
+        save_b = QPushButton("Save PNG…", objectName="primary")
+        save_b.clicked.connect(self.save_image)
+        close_b = QPushButton("Close", objectName="ghost")
+        close_b.clicked.connect(self.accept)
+        for b in (copy_b, save_b, close_b):
+            b.setAutoDefault(False)
+            side.addWidget(b)
+        wrap = QWidget()
+        wrap.setLayout(side)
+        wrap.setFixedWidth(300)
+        lay.addWidget(wrap)
+        self.render()
+
+    def _pick_theme(self, name):
+        self.theme = name
+        self.render()
+
+    def _pick_size(self, name):
+        self.size_key = name
+        self.render()
+
+    def render(self):
+        self.img = render_quote_image(self.row, self.theme, self.size_key)
+        pm = QPixmap.fromImage(self.img).scaled(self.prev.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self.prev.setPixmap(pm)
+        self.info.setText(f"{self.img.width()} × {self.img.height()} px")
+
+    def copy_image(self):
+        QApplication.clipboard().setImage(self.img)
+        toast(self, "Image copied")
+
+    def save_image(self):
+        slug = re.sub(r"[^\w\-]+", "_", self.row[2] or "quote").strip("_")[:30] or "quote"
+        path, _ = QFileDialog.getSaveFileName(self, "Save the quote image", f"quote-{slug}.png",
+                                              "PNG image (*.png)")
+        if not path:
+            return
+        if not path.lower().endswith(".png"):
+            path += ".png"
+        if self.img.save(path, "PNG"):
+            toast(self, f"Saved — {Path(path).name}")
+        else:
+            QMessageBox.warning(self, "Couldn’t save", "The picture could not be written to that place.")
+
+
 # -------------------------------------------------------------- window
 def TOAST_ACCENT():
     """The toast is the inverse of the theme, so its button uses the OTHER theme's accent colour."""
@@ -3641,6 +4830,22 @@ QFrame#toast QLabel {{ color:{T['bg']}; background:transparent; }}
 QPushButton#toastbtn {{ background:transparent; color:{TOAST_ACCENT()}; padding:6px 12px; border-radius:8px; font-weight:700; }}
 QPushButton#toastbtn:hover {{ background:rgba(128,128,128,0.22); }}
 QToolTip {{ background:{T['card']}; color:{T['text']}; border:1px solid {T['border']}; padding:6px 8px; }}
+QTextEdit[invalid="true"], QTextEdit[invalid="true"]:focus, QComboBox[invalid="true"], QComboBox[invalid="true"]:focus {{ border:1px solid #e0526a; }}
+#qbody {{ background:transparent; }}
+QFrame#qcard {{ background:{T['card']}; border:1px solid {T['border']}; border-radius:16px; }}
+QFrame#qcard:hover {{ border:1px solid {T['accent']}; }}
+QFrame#qcard QLabel {{ background:transparent; }}
+QFrame#qcard QLabel#qtext {{ font-size:16px; }}
+QFrame#qcard QLabel#qmark {{ color:{T['accent']}; font-size:46px; font-weight:800; font-family:'Georgia','Noto Serif','DejaVu Serif',serif; }}
+QFrame#qcard QLabel#qmeta {{ color:{T['muted']}; font-size:12px; font-weight:600; }}
+QFrame#qcard QLabel#qnote {{ color:{T['muted']}; font-style:italic; background:{T['input']}; border-radius:10px; padding:8px 12px; }}
+QFrame#qcard QLabel#qdate {{ color:{T['muted']}; font-size:11px; }}
+QPushButton#qaction {{ background:transparent; color:{T['muted']}; padding:5px 10px; border-radius:8px; font-size:12px; }}
+QPushButton#qaction:hover {{ background:{T['input']}; color:{T['text']}; }}
+QPushButton#qheart {{ background:transparent; padding:4px; border-radius:8px; }}
+QPushButton#qheart:hover {{ background:{T['input']}; }}
+QPushButton#herobtn {{ background:rgba(255,255,255,0.18); color:white; padding:8px 16px; border-radius:10px; }}
+QPushButton#herobtn:hover {{ background:rgba(255,255,255,0.32); }}
 """
 
 
@@ -3673,7 +4878,7 @@ class Window(QWidget):
         self.group = QButtonGroup(self)
         self.group.setExclusive(True)
         self.nav = {}
-        for name in ["All"] + STATUSES + [WISH]:
+        for name in ["All"] + STATUSES + [WISH, QUOTES]:
             if name == WISH:
                 sl.addSpacing(10)
             b = QPushButton(objectName="nav")
@@ -3727,6 +4932,7 @@ class Window(QWidget):
         self.search.textChanged.connect(self.refresh)
         add = QPushButton("+  Add book", objectName="primary")
         add.setCursor(Qt.PointingHandCursor)
+        self.add_btn = add
         add.clicked.connect(self.add_book)
         self.sort_c = QComboBox()
         self.sort_c.addItems(list(SORTS))
@@ -3739,6 +4945,7 @@ class Window(QWidget):
         online = QPushButton("Find online", objectName="ghost")
         online.setCursor(Qt.PointingHandCursor)
         online.clicked.connect(lambda: self.open_discover(""))
+        self.online_btn = online
         top.addWidget(online)
         top.addWidget(add)
         main.addLayout(top)
@@ -3766,6 +4973,9 @@ class Window(QWidget):
 
         self.empty_box = EmptyState()
         main.addWidget(self.empty_box, 1)
+        self.quotes_page = QuotesPage(self)
+        self.quotes_page.setVisible(False)
+        main.addWidget(self.quotes_page, 1)
         outer.addLayout(main, 1)
 
         self._toast = Toast(self)
@@ -3817,7 +5027,10 @@ class Window(QWidget):
         self.refresh()
 
     def refresh(self):
-        if self.status == WISH:
+        in_quotes = self.status == QUOTES
+        if in_quotes:
+            rows = []                               # the Quotes page builds its own cards
+        elif self.status == WISH:
             rows = self.store.wish_search(self.search.text(), self.sort_c.currentText())
         else:
             rows = self.store.search(self.search.text(), self.status, self.sort_c.currentText())
@@ -3830,16 +5043,28 @@ class Window(QWidget):
             it.setToolTip(card_tooltip(row))
             self.list.addItem(it)
         self.list.setVisible(bool(rows))
-        self.empty_box.setVisible(not rows)
-        if not rows:
+        self.empty_box.setVisible(not rows and not in_quotes)
+        if not rows and not in_quotes:
             self.show_empty(self.search.text().strip())
+        self.quotes_page.setVisible(in_quotes)
+        self.sort_c.setVisible(not in_quotes)
+        self.online_btn.setVisible(not in_quotes)
+        self.add_btn.setText("+  Add quote" if in_quotes else "+  Add book")
+        self.search.setPlaceholderText("Search quotes, notes, books..." if in_quotes
+                                       else "Search title or author...")
         counts = self.store.counts()
         counts[WISH] = self.store.wish_count()
+        counts[QUOTES] = self.store.quote_count()
         for name, b in self.nav.items():
             label = "All books" if name == "All" else name
             b.setText(f"{label}     {counts[name]}")
         self.heading.setText("All books" if self.status == "All" else self.status)
-        self.sub.setText(f"{len(rows)} book{'s' if len(rows) != 1 else ''}")
+        if in_quotes:
+            self.quotes_page.reload()
+            n = self.quotes_page.count
+            self.sub.setText(f"{n} quote{'s' if n != 1 else ''}")
+        else:
+            self.sub.setText(f"{len(rows)} book{'s' if len(rows) != 1 else ''}")
         avg = self.store.average_rating()
         self.stats.setText(f"Total books: {counts['All']}\n"
                            + (f"Average rating: {avg:.1f} / 5" if avg else "No ratings yet"))
@@ -3894,6 +5119,9 @@ class Window(QWidget):
             pass                                    # tidying must never stop the app
 
     def add_book(self):
+        if self.status == QUOTES:
+            self.add_quote()
+            return
         if self.status == WISH:
             d = BookDialog(self, self.store, wish=True)
             if d.exec():
@@ -3937,7 +5165,7 @@ class Window(QWidget):
             d.mark_clean()
         if d.exec():
             if d.deleted:
-                self.remove_book(book, False)
+                self.remove_book(book, False, d.quotes_choice)
             else:
                 self.store.update(book[0], *d.values())
             self.refresh()
@@ -4021,33 +5249,168 @@ class Window(QWidget):
             self.refresh()
             self.tidy_covers()
 
-    def remove_book(self, book, wish):
+    def remove_book(self, book, wish, quotes_choice=None):
         """Deletes at once and offers Undo for a few seconds (instead of asking first). The row is
         kept as it was; Undo puts it back with the same id, cover, rating, notes and dates. The cover
-        file stays on disk while the offer is open (tidy_covers waits for it)."""
+        file stays on disk while the offer is open (tidy_covers waits for it).
+        A library book that has quotes is the one exception: the person is asked what happens to the
+        quotes ('delete' / 'keep'); BookDialog may already have asked (quotes_choice).
+        Returns False when the person cancelled."""
         snapshot = tuple(book)
-        (self.store.wish_delete if wish else self.store.delete)(book[0])
+        n_quotes, gone = 0, []
+        if not wish:
+            n_quotes = self.store.quote_count_for(snapshot[0])
+            if n_quotes:
+                if quotes_choice is None:
+                    quotes_choice = ask_book_quotes(self, snapshot[1], n_quotes)
+                if quotes_choice is None:
+                    return False
+                if quotes_choice == "delete":
+                    gone = self.store.quotes_of_book(snapshot[0])
+        if wish:
+            self.store.wish_delete(book[0])
+        else:
+            self.store.delete(book[0], with_quotes=bool(gone))
         name = snapshot[1] if len(snapshot[1]) <= 40 else snapshot[1][:39] + "…"
         where = "wishlist" if wish else "library"
-        self.last_deleted = (snapshot, wish)
-        toast(self, f"“\u2068{name}\u2069” removed from your {where}", "Undo",
-              lambda: self.undo_delete(snapshot, wish), ms=7000, pending=True)
+        # kept quotes stay in the database with the book's id: if Undo brings the book back, they are its quotes again
+        self.last_deleted = dict(kind="book", row=snapshot, wish=wish, quotes=gone)
+        extra = (f" with its {len(gone)} quote{'s' if len(gone) != 1 else ''}" if gone
+                 else f" (its {n_quotes} quote{'s' if n_quotes != 1 else ''} kept)" if n_quotes else "")
+        toast(self, f"“\u2068{name}\u2069” removed from your {where}{extra}", "Undo",
+              self.undo_delete, ms=7000, pending=True)
+        return True
 
-    def undo_delete(self, snapshot=None, wish=None):
-        if snapshot is None:
-            snapshot, wish = getattr(self, "last_deleted", (None, None))
-        if snapshot is None:
+    def undo_delete(self, *_):
+        d = getattr(self, "last_deleted", None)
+        self.last_deleted = None
+        if not d:
             return
-        self.last_deleted = (None, None)
         try:
-            if (self.store.wish_exists if wish else self.store.exists)(snapshot[1]):
-                raise ValueError("same title")
-            self.store.restore_row(snapshot, wish)
+            if d["kind"] == "quote":
+                self.store.quote_restore(d["row"])
+            else:
+                snapshot, wish = d["row"], d["wish"]
+                if (self.store.wish_exists if wish else self.store.exists)(snapshot[1]):
+                    raise ValueError("same title")
+                self.store.restore_row(snapshot, wish, d["quotes"])
         except (ValueError, sqlite3.Error):
-            toast(self, "Couldn’t restore it — a book with this title was added in the meantime.")
+            toast(self, "Couldn’t restore it — a book with this title was added in the meantime."
+                  if d["kind"] == "book" else "Couldn’t restore the quote.")
             return
         self.refresh()
         toast(self, "Restored")
+
+    # -- quotes
+    def add_quote(self, book_id=None):
+        if not self.store.count():
+            toast(self, "Add a book to your library first — a quote belongs to a book.")
+            return
+        if book_id is None and self.status == QUOTES:
+            book_id = self.quotes_page.filter_book_id()     # filtered by a book: start with that book
+        page, saved = "", 0
+        while True:
+            d = QuoteDialog(self, self.store, book_id=book_id, page=page, saved=saved)
+            if not d.exec():
+                break
+            v = d.values()
+            self.store.quote_add(*v)
+            saved += 1
+            self.refresh()
+            if not d.again:
+                break
+            book_id, page = v[0], v[4]                      # the next one starts with the same book and page
+        if saved:
+            toast(self, f"{saved} quotes added" if saved != 1 else "Quote added")
+        self.tidy_covers()
+
+    def edit_quote(self, row):
+        d = QuoteDialog(self, self.store, quote=row)
+        if d.exec():
+            if d.deleted:
+                self.remove_quote(row)
+            else:
+                self.store.quote_update(row[0], *d.values())
+        self.refresh()
+
+    def remove_quote(self, row):
+        self.store.quote_delete(row[0])
+        self.last_deleted = dict(kind="quote", row=tuple(row))
+        toast(self, "Quote removed", "Undo", self.undo_delete, ms=7000, pending=True)
+
+    def copy_quote(self, row):
+        QApplication.clipboard().setText(quote_citation(row))
+        toast(self, "Copied with its author and book")
+
+    def quote_image(self, row):
+        QuoteImageDialog(self, row).exec()
+
+    def quote_menu(self, row, pos):
+        menu = QMenu(self)
+        menu.setWindowFlags(menu.windowFlags() | Qt.FramelessWindowHint | Qt.NoDropShadowWindowHint)
+        menu.setAttribute(Qt.WA_TranslucentBackground)        # lets the QSS rounded corners show
+        menu.setMinimumWidth(220)
+        menu.addAction("Edit…").setData("edit")
+        menu.addAction("Copy with author and book").setData("copy")
+        menu.addAction("Make image…").setData("image")
+        menu.addAction("Remove from favorites" if row[7] else "Add to favorites").setData("fav")
+        menu.addSeparator()
+        menu.addAction("Delete").setData("delete")
+        chosen = menu.exec(pos)
+        key = chosen.data() if chosen else None            # run it after the menu has closed
+        if key == "edit":
+            self.edit_quote(row)
+        elif key == "copy":
+            self.copy_quote(row)
+        elif key == "image":
+            self.quote_image(row)
+        elif key == "fav":
+            self.store.quote_set_fav(row[0], 0 if row[7] else 1)
+            self.refresh()
+        elif key == "delete":
+            self.remove_quote(row)
+            self.refresh()
+
+    def export_quotes_csv(self, host=None):
+        host = host or self
+        path, _ = QFileDialog.getSaveFileName(self, "Export quotes", "my_quotes.csv", "CSV files (*.csv)")
+        if not path:
+            return
+        rows = self.store.quote_rows(sort="By book")
+        with open(path, "w", newline="", encoding="utf-8-sig") as fh:   # opens fine in Excel
+            w = csv.writer(fh)
+            w.writerow(["Book", "Author", "Quote", "Page", "Note", "Favorite", "Date"])
+            for _id, _b, t, a, text, page, note, fav, created, _c, _o in rows:
+                w.writerow([t, a, text, page, note, 1 if fav else "", created[:10]])
+        toast(host, f"Exported {len(rows)} quote{'s' if len(rows) != 1 else ''}")
+
+    def import_quotes_csv(self, host=None):
+        host = host or self
+        if not self.store.count():
+            toast(host, "Add your books first — each quote belongs to a book in your library.")
+            return
+        path, _ = QFileDialog.getOpenFileName(self, "Import quotes from CSV", "", "CSV files (*.csv)")
+        if not path:
+            return
+        try:
+            make_backup(self.store, force=True, tag="-before-import")
+            added, dup, nobook, bad, missing = import_quotes_file(self.store, path)
+        except Exception as e:
+            QMessageBox.warning(self, "Import failed", str(e))
+            return
+        self.refresh()
+        parts = [f"{added} added", f"{dup} already saved"]
+        if nobook:
+            parts.append(f"{nobook} skipped (book not in your library)")
+        if bad:
+            parts.append(f"{bad} without text")
+        toast(host, "Quotes import finished — " + " · ".join(parts), ms=8000)
+        if missing:
+            QMessageBox.information(
+                self, "Some books are not in your library",
+                "Quotes of these books were skipped because the books are not in your library:\n\n"
+                + "\n".join(f"• {t}" for t in missing[:12]) + ("\n…" if len(missing) > 12 else "")
+                + "\n\nAdd the books first, then import the file again. Quotes already saved are skipped.")
 
     def toast_ready(self):
         t = getattr(self, "_toast", None)
@@ -4144,6 +5507,8 @@ class Window(QWidget):
         self.theme_btn.setText("Light mode" if self.theme == "dark" else "Dark mode")
         self.search_clear.setIcon(clear_icon())
         self.list.viewport().update()
+        if hasattr(self, "quotes_page"):
+            self.quotes_page.theme_changed()
 
 
 def load_local_fonts():

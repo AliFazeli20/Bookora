@@ -3,6 +3,37 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.0] - 2026-11-18
+
+### Added
+- **Quotes section** (new page in the sidebar): save the sentences you love from your books, each with
+  the book, an optional page number and your own note. Quotes are searchable (text, note, book, author).
+- **Quote of the day** at the top of the page (the same quote all day), with an "Another" button.
+- Favorite quotes (heart), and a filter for all quotes, favorites or a single book. Sort by newest,
+  oldest, by book, or favorites first.
+- Add / edit quote dialog with a book picker that finds a book anywhere in its title. "Save & add
+  another" keeps the book and the page, so a whole evening of quotes can be typed in a row.
+  Duplicate quotes in the same book are refused.
+- Copy a quote together with its author, book and page.
+- Make an image of a quote to share: 6 styles (Midnight, Paper, Light, Ocean, Violet, Cover), 3 sizes
+  (Square, Story, Wide), copy it or save it as PNG. Drawn with QPainter, no extra library.
+- Import and export quotes as CSV in Data & backup. Import is all-or-nothing, makes a safety backup
+  first, and lists the books that were not found in your library.
+- "Only by author" filter in Find online (Book title searches): keeps only books by that author,
+  accepts close spellings (Dostoevsky / Dostoyevsky) and Persian names (the English name is looked up
+  on Wikidata, so Open Library and Apple Books can search too).
+- Quote cards and quote images support right-to-left text (Persian), including verse with line breaks.
+
+### Changed
+- Deleting a book that has quotes asks whether to delete the quotes too or keep them. Undo brings back
+  the book together with the quotes that were deleted with it.
+- Renaming a book or changing its author updates its quotes.
+- The CSV buttons in Data & backup are now named "books" and "quotes".
+
+### Database
+- New `quotes` table, created automatically on first start. The `books` and `wishlist` tables are not
+  changed, and existing libraries and backups keep working.
+
 ## [0.2.0] - 2026-11-10
 
 ### Added
@@ -61,5 +92,6 @@ All notable changes to this project will be documented in this file.
 - Dark and light themes.
 - Local SQLite database storage.
 
+[0.3.0]: https://github.com/AliFazeli20/Bookora/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/AliFazeli20/Bookora/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/AliFazeli20/Bookora/releases/tag/v0.1.0
